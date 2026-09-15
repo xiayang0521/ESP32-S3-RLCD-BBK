@@ -251,6 +251,11 @@ static void p_select_game_poll(ui_ctx_t *ctx) {
     os_pane_poll(ctx, &s_gp);   /* 右栏触摸拖动滚动 */
 }
 
+/* 双指: 上/下滑=游戏列表整屏翻页 (模板消费, 不冒泡 HOME); 点击=全局 BACK */
+static bool p_select_game_multi(ui_ctx_t *ctx, const multi_gesture_evt_t *evt) {
+    return os_pane_multi_gesture(ctx, &s_gp, evt);
+}
+
 static const os_module_t s_mod_select_game = {
     .name       = "select_game",
     .page_id    = OS_PAGE_SELECT_GAME,
@@ -259,6 +264,7 @@ static const os_module_t s_mod_select_game = {
     .action     = p_select_game_action,
     .touch      = p_select_game_touch,
     .poll       = p_select_game_poll,
+    .multi_gesture = p_select_game_multi,
     .fullscreen = false,   /* 3.3: 游戏菜单显示状态栏 */
 };
 
