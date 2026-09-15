@@ -92,10 +92,49 @@ bool input_get_touch_pos(int *x, int *y);
  * 弹窗/页面 render 再调会破坏其 s_o_armed 锁存, 导致按压反馈失效. */
 bool input_touch_now(int *x, int *y);
 
-/* V1.1.x: 多点触控 — 返回当前触摸点 (最多 TP_MAX_POINTS=5 点, 已映射屏幕坐标).
+/* V1.1.x: 多点触控 — 返回当前触摸点 (最多 TP_MAX_POINTS=2 点, 已映射屏幕坐标).
  * pts[0..n-1] 各点 (未按下的置 pressed=false), count 返回实际点数 (0..TP_MAX_POINTS).
  * 调用方需在 input_get_action/input_get_touch_pos 同帧读取 (依赖同一触摸缓存). */
 void input_get_touch_multi(tp_point_t pts[TP_MAX_POINTS], int *count);
+
+/* ==== 双指手势 (CST836U 两点触控) ====
+ * 独立于单指手势机: 双指落下到全部抬起期间屏蔽单指, 互斥不串扰.
+ * 事件分两类投递:
+ *   - 捏合 (PINCH): 高频连续事件, 跟手调字号预览, 仅经页面回调实时投递, 不锁存;
+ *     双指全部抬起时再补一个 MULTI_GESTURE_PINCH_END (同样仅走回调, 不锁存),
+ *     页面据此一次性提交重排, 避免捏合途中逐档重新分页;
+ *   - 离散手势 (双指点击/四向滑动): 先经页面回调, 返回 true 表示已消费
+ *     (如阅读器双指左右滑翻章); 未消费则锁存, 由主循环 input_take_multi_gesture
+ *     取走做全局兜底 (双指点击=返回, 双指上滑=HOME). */
+typedef enum {
+    MULTI_GESTURE_NONE = 0,
+    MULTI_GESTURE_TAP,        /* 双指点击: 两指几乎不动且短时按下后抬起 */
+    MULTI_GESTURE_SWIPE_UP,
+    MULTI_GESTURE_SWIPE_DOWN,
+    MULTI_GESTURE_SWIPE_LEFT,
+    MULTI_GESTURE_SWIPE_RIGHT,
+    MULTI_GESTURE_PINCH_END,  /* 捏合会话结束 (双指抬起): 页面据此一次性提交字号重排, 仅回调不锁存 */
+} multi_gesture_t;
+
+/* 双指手势事件描述 (屏幕逻辑坐标, 已做 400x300 映射与旋转). */
+typedef struct {
+    multi_gesture_t type;     /* 离散手势类型 */
+    int cx, cy;               /* 双指中点 (离散手势: 手势起点中点) */
+    int pinch_steps;          /* 捏合步进: >0=放大(张开), <0=缩小(收拢), 每次回调为增量档数 */
+} multi_gesture_evt_t;
+
+/* 页面回调: 双指事件发生时调用. evt->type 为离散手势时返回 true=页面已消费
+ * (不再进入全局兜底); 捏合回调 (type==MULTI_GESTURE_NONE 且 pinch_steps!=0)
+ * 与 PINCH_END 的返回值无意义. 传 NULL 清除回调. */
+typedef bool (*input_multi_cb_t)(const multi_gesture_evt_t *evt);
+void input_set_multi_gesture_cb(input_multi_cb_t cb);
+
+/* 主循环/os 层取走一次"页面未消费"的离散双指手势 (取走后清零).
+ * 返回 true 表示有未消费手势, evt 写入事件内容 (可为 NULL 仅探测). */
+bool input_take_multi_gesture(multi_gesture_evt_t *evt);
+
+/* 只读查询双指当前是否处于活动 (含抬起后的"余指武装期"), 供 UI 抑制按压反馈. */
+bool input_multi_active(void);
 
 /* V1.0.9x: 返回本次手势按下的起点屏幕坐标 (供主菜单拖动排序判定"是否已移动").
  * 未按住或无手势时返回 false. 必须与 input_get_touch_pos 同帧/之后调用. */
