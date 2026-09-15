@@ -32,7 +32,7 @@
 <body>
 <div class="wrap">
   <div class="card">
-    <div class="title">LinTOS 固件刷写 <span class="ver">v1.3</span></div>
+    <div class="title">LinTOS 固件刷写 <span class="ver">v1.3.1</span></div>
     <label><input type="radio" name="src" value="github" checked> GitHub 固件（推荐）</label>
     <select id="verSel"><option value="latest">最新版（加载中…）</option></select>
     <label><input type="radio" name="src" value="local"> 本地文件</label>
@@ -50,8 +50,9 @@
 import { ESPLoader, Transport } from './esptool-js.bundle.js';
 
 /* 固件 = GitHub 仓库文件, 依次尝试: Releases 直链 → raw 直链（仓库内镜像） */
-const REPO = 'LinIT-L/ESP32-S3-RLCD-BBK';
-const FW_ASSET = 'LinTOS_v1.3_16MB.bin';              /* v1.3 起的最新附件名 */
+const REPO = 'xiayang0521/ESP32-S3-RLCD-BBK';
+const FW_ASSET = 'LinTOS_v1.3.1_16MB.bin';            /* v1.3.1 起的最新附件名 */
+const FW_ASSET_LEGACY_LINIT = 'LinTOS_v1.3_16MB.bin'; /* v1.3（LinIT-L 原始附件名） */
 const FW_ASSET_LEGACY = 'ESP32-S3-RLCD-BBK-16MB.bin'; /* v1.1/v1.2 旧附件名 */
 const FW_REPO_MIRROR = 'merged_16mb.bin';             /* 仓库 flash/ 目录同名镜像（raw 兜底用） */
 const FW_URLS = [
@@ -93,7 +94,7 @@ async function loadVersions() {
   }
   /* 兜底: 接口全部失败/缓存滞后时, 用内置版本列表保证可选到新版 (最新在前) */
   if (tags.length === 0) {
-    tags = ['v1.3', 'v1.2', 'v1.1'];
+    tags = ['v1.3.1', 'v1.3', 'v1.2', 'v1.1'];
   }
   if (tags.length === 0) {
     sel.innerHTML = '<option value="latest">最新版（无法取版本列表，默认最新）</option>';
@@ -175,7 +176,13 @@ async function downloadFirmware() {
     } else {
       status.textContent = '正在下载 ' + verLabel + ' 固件…';
       /* 附件名随版本: v1.3 起为 LinTOS_v*_16MB.bin, 旧版 v1.1/v1.2 为 ESP32-S3-RLCD-BBK-16MB.bin */
-      const verAsset = /^v1\.(3|[0-9]{2,}|[2-9])/.test(ver) ? ('LinTOS_' + ver.replace(/^v/, '') + '_16MB.bin') : FW_ASSET_LEGACY;
+      /* v1.3.x / v1.4+ 用带小数版本附件名; 兼容 v1.3 原始单段命名; 旧版 v1.1/v1.2 用遗留名 */
+      const verAsset = (/^v1\.(3|[0-9]{2,}|[2-9])/.test(ver) && ver.indexOf('.') === ver.lastIndexOf('.')) ?
+        ('LinTOS_' + ver.replace(/^v/, '') + '_16MB.bin') : (
+          ver === 'v1.3' ? FW_ASSET_LEGACY_LINIT :
+          /^v1\.(3|[0-9]{2,})/.test(ver) ? ('LinTOS_' + ver.replace(/^v/, '') + '_16MB.bin') :
+          FW_ASSET_LEGACY
+        );
       const u = 'https://github.com/' + REPO + '/releases/download/' + ver + '/' + verAsset;
       try { r = await fetch(u); } catch (e) { r = null; }
       if (!r || !r.ok) throw new Error('版本 ' + verLabel + ' 固件下载失败');

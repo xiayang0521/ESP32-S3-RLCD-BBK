@@ -44,6 +44,9 @@ static bool s_bg_dirty = false;
 static ui_ctx_t *s_os_ctx = NULL;
 int os_current_page(void) { return s_os_ctx ? s_os_ctx->current_page : -1; }
 
+/* 前向声明: 双指路由定义在 os_cur_mod 之后, 而 os_init 启动时就要注册回调 */
+static bool os_multi_gesture_route(const multi_gesture_evt_t *evt);
+
 void os_init(ui_ctx_t *ctx, st7305_handle_t *lcd)
 {
     s_os_ctx = ctx;
@@ -59,6 +62,8 @@ void os_init(ui_ctx_t *ctx, st7305_handle_t *lcd)
     s_bg_dirty        = false;
     s_service_count   = 0;
     for (int i = 0; i < OS_PAGE_COUNT; i++) { s_modules[i] = NULL; s_module_set[i] = false; }
+    /* 双指手势: 内核常驻唯一回调, 之后按当前页 os_module 派发 (见 os_multi_gesture_route) */
+    input_set_multi_gesture_cb(os_multi_gesture_route);
     /* 编译期注册内建模块 */
     os_register_all_internal();
     /* 加载游戏收藏 (从 appdata 分区配置区, 不读 TF 卡) */
@@ -90,6 +95,31 @@ void os_register_service(const os_service_t *svc)
 static const os_module_t *os_cur_mod(void)
 {
     return s_cur_mod;
+}
+
+/* 双指手势常驻路由: 全系统唯一 input 双指回调, 按当前页派发给其 ops.
+ * 为什么放内核而不是各页 register/unregister: 页面切换频繁, 逐页抢注/注销
+ * 易泄漏回调槽 (page_book 书架/阅读器就曾争用同一槽); 内核跟随页面栈派发,
+ * 天然无泄漏、无争抢. 页面无 ops 或返回 false 时交还输入层锁存,
+ * 由 main.c 全局兜底处理 (TAP=BACK / 上滑=HOME). */
+static bool os_multi_gesture_route(const multi_gesture_evt_t *evt)
+{
+    if (!s_os_ctx) return false;
+    const os_module_t *target = s_cur_mod;
+    /* 纯 toast (无模态弹窗、仅自动消失的提示) 期间 DIALOG 页会临时占据栈顶,
+     * 而它不消费双指事件; input 层的捏合步进既不锁存、回调前又已核销位移,
+     * 直接派发会把整段持续捏合吞掉且无法补发. 故把事件透传给 toast 之下的
+     * 真实页面; 真正的模态弹窗 (depth>0, 如退出确认框) 绝不穿透. */
+    if (target && target->page_id == OS_PAGE_DIALOG
+        && os_dialog_depth() == 0 && os_dialog_toast_active()
+        && s_stack_top >= 0) {
+        os_page_t under = s_back_stack[s_stack_top];
+        const os_module_t *under_mod =
+            (under >= 0 && under < OS_PAGE_COUNT) ? s_modules[under] : NULL;
+        if (under_mod) target = under_mod;
+    }
+    if (!target || !target->multi_gesture) return false;
+    return target->multi_gesture(s_os_ctx, evt);
 }
 
 bool os_push(ui_ctx_t *ctx, os_page_t page)

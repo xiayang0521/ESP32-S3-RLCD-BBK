@@ -2,7 +2,8 @@
  * @file touch_panel.c
  * @brief 电容触摸屏驱动: 自动识别 GT911 / CST816 / FT6236
  *
- * 三种芯片都是 I2C 从机, 读到的都是"点数 + 第一个点的 XY 坐标".
+ * 三种芯片都是 I2C 从机, 读到的是"点数 + 各触点的 XY 坐标": GT911/FT6236
+ * 按硬件能力读多点; CST836U 兼容原厂单指帧并自适应解析双指 (未确认时回退单指).
  * 本驱动只读点, 手势识别在 input.c 里做 (按坐标增量判方向, 与分辨率无关).
  *
  * I2C 使用独立的 I2C_NUM_1 (音频 ES8311/ES7210 占用 I2C_NUM_0), 互不干扰.
@@ -452,6 +453,7 @@ static bool gt911_read_points(tp_point_t pts[TP_MAX_POINTS], int *count) {
     for (int i = 0; i < cnt; i++) {
         const uint8_t *pp = p + i * 8;
         pts[i].pressed = true;
+        pts[i].id = (uint8_t)i;
         pts[i].x = (int16_t)((pp[2] << 8) | pp[1]);   /* X = high<<8 | low */
         pts[i].y = (int16_t)((pp[4] << 8) | pp[3]);   /* Y = high<<8 | low */
     }
@@ -463,31 +465,138 @@ static bool gt911_read_points(tp_point_t pts[TP_MAX_POINTS], int *count) {
     return true;
 }
 
+/*
+ * ==================== CST836U 双指读取 ====================
+ *
+ * 帧布局 (以 skill ch03 逻辑分析仪实测帧为准, 非家族通识猜测):
+ *   原厂每次中断读两段: reg0x02 手势(1B) + reg0x01 起 5 字节简帧. 实测
+ *   F1 简帧 = 01 81 77 01 11, F7 抬起帧 = 00 41 77 01 11, 由此严格对齐
+ *   CST816 标准寄存器模型 (本驱动从 reg0x00 连读 13 字节, d[] 下标=寄存器号):
+ *
+ *     d[0]   reg0x00 保留
+ *     d[1]   reg0x01 触点数 n (实测: 按下=01, 抬起 F7=00 —— 抬起判定只看它)
+ *     d[2..7]  reg0x02..0x07 点1: X高 X低 Y高 Y低 权重 面积
+ *     d[8..13] reg0x08..0x0D 点2: 同上
+ *
+ *   12bit 坐标: X=(X高&0x0F)<<8|X低; X高高 4 bit=事件(0x8 接触),
+ *               低 4 bit=手指编号(1 第一点 / 2 可区分的第二点).
+ *   实测校验: F1 点1 d[2..5]=81 77 01 11 -> X=0x177, Y=0x011, 与抓包一致.
+ *
+ * 几何限制 (skill ch04 长边投影判据): 竖屏下两指沿长边(竖直)投影错开编号才
+ *   给 2; 严格左右平齐退化为单指标识. 故第二点以 n==2 为主判据, 坐标合法性
+ *   兜底, 手势层用第二点实时坐标做补偿, 不把编号位当唯一来源.
+ *
+ * 为什么需要跨帧状态机:
+ *   本驱动是轮询而非 INT 中断, 双指在边缘姿态可能瞬间抖出幽灵第二点. 用
+ *   "连续 N 帧确认"仲裁: 进入需连续确认帧, 一旦本帧丢失立即退出 (松手跟手).
+ *   灵敏优先档把确认帧降到 1, 跟手优先, 接受反射屏偶发误触待真机微调. */
+
+#define CST_FRAME_BYTES   13    /* reg0x00..0x0C: 保留 + 点数 + 两个 6 字节点 */
+#define CST_TWO_CONFIRM   1     /* 第二点连续确认帧: 1=灵敏优先(跟手), 误触可调大 */
+
+/* 驱动内双指总开关: 真机验证异常时可置 0 一键回退到原厂单指行为 */
+#define CST_TWO_FINGER    1
+
+static struct {
+    bool     two_active;                 /* 已确认的双指状态 (对外生效) */
+    uint8_t  confirm;                    /* 第二点连续出现帧计数 */
+    int16_t  last_x[TP_MAX_POINTS];      /* 上一帧两点坐标, 用于就近/冻结判定 */
+    int16_t  last_y[TP_MAX_POINTS];
+    bool     last_valid[TP_MAX_POINTS];  /* 上一帧该点是否有效 */
+} s_cst = {0};
+
+/* 判断解析出的坐标是否落在面板合理范围 (滤除 0x000/0xFFF 之类冻结/噪声值) */
+static bool cst_coord_valid(int x, int y) {
+    return (x >= 0 && x <= s_res_x && y >= 0 && y <= s_res_y);
+}
+
+/* 按 CST816 标准 6 字节/点布局解析点 k (k=0->reg0x02, k=1->reg0x08).
+ * 严格对齐 skill ch03 实测帧; 取代早期 4/5 字节步进的双布局猜测. */
+static void cst_decode_point(const uint8_t *d, int k,
+                             uint8_t *xh, int *x, int *y) {
+    int b = 2 + k * 6;
+    *xh = d[b];
+    *x = (int)(((d[b] & 0x0F) << 8) | d[b + 1]);
+    *y = (int)(((d[b + 2] & 0x0F) << 8) | d[b + 3]);
+}
+
 static bool cst816_read_points(tp_point_t pts[TP_MAX_POINTS], int *count) {
-    /* CST8xx 系列 (本设备 CST836U) 实测布局 + 官方 esp_lcd_touch_cst816s 资料:
-     * 芯片虽在点名里可报 2, 但官方确认 "始终只返回单指事件 + 手势",
-     * 第二点坐标寄存器无有效数据 => 只信任点1, 避免双指时幽灵点乱跳.
-     * 布局: 从 reg 0x00 连续读 11 字节. 0x02=点数; 点1 12 位坐标:
-     *   X = ((d[3]&0x0F)<<8)|d[4], Y = ((d[5]&0x0F)<<8)|d[6].
-     * 实测对照 (n=1, d=00 D7 00 C2): X=0xD7=215, Y=0xC2=194. */
-    uint8_t d[11] = {0};
-    if (tp_i2c_read8(0x00, d, 11) != ESP_OK) {
+    uint8_t d[CST_FRAME_BYTES] = {0};
+    if (tp_i2c_read8(0x00, d, sizeof(d)) != ESP_OK) {
         return false;
     }
-    int n = d[2] & 0x0F;
+
+    /* 抬起帧判定只看手指数 reg0x01 (实测 F7=00); 编号位在 F7 仍为 1, 不能用. */
+    int n = (int)d[1];
     if (n <= 0) {
-        for (int i = 0; i < TP_MAX_POINTS; i++) pts[i].pressed = false;
+        for (int i = 0; i < TP_MAX_POINTS; i++) {
+            pts[i].pressed = false;
+            pts[i].id = 0;
+            s_cst.last_valid[i] = false;
+        }
+        s_cst.two_active = false;
+        s_cst.confirm = 0;
         *count = 0;
         return true;
     }
-    /* 只取点1 (单指有效), 丢弃点2 */
-    int x = (int)(((d[3] & 0x0F) << 8) | d[4]);
-    int y = (int)(((d[5] & 0x0F) << 8) | d[6]);
+
+    /* 点1: reg0x02..0x05. 坐标非法(冻结/噪声帧)时保持上一帧, 避免跳变. */
+    uint8_t xh1;
+    int x1, y1;
+    cst_decode_point(d, 0, &xh1, &x1, &y1);
+    if (!cst_coord_valid(x1, y1)) {
+        return true;
+    }
+
     pts[0].pressed = true;
-    pts[0].x = (int16_t)x;
-    pts[0].y = (int16_t)y;
-    pts[1].pressed = false;   /* 第二点无效, 恒为未按压 */
-    *count = 1;
+    pts[0].x = (int16_t)x1;
+    pts[0].y = (int16_t)y1;
+    pts[0].id = 0;
+    s_cst.last_x[0] = pts[0].x;
+    s_cst.last_y[0] = pts[0].y;
+    s_cst.last_valid[0] = true;
+
+    /* ---- 第二点 (总开关关闭时直接回退单指) ----
+     * 主判据 n==2; 点1 编号位==2 作辅助 (长边投影错开时芯片置 2).
+     * 点2 在 reg0x08..0x0B, 仍要求坐标落在面板内, 滤冻结/噪声. */
+    bool two_raw = false;
+    int x2 = 0, y2 = 0;
+#if CST_TWO_FINGER
+    if (n >= 2 || (xh1 & 0x0F) == 0x02) {
+        uint8_t xh2;
+        cst_decode_point(d, 1, &xh2, &x2, &y2);
+        bool touching = (xh2 & 0xF0) == 0x80 || (xh2 & 0x0F) == 0x02;
+        if (touching && cst_coord_valid(x2, y2)) {
+            two_raw = true;
+        }
+    }
+#endif
+
+    /* 跨帧确认: 连续 CST_TWO_CONFIRM 帧有可信点2 才对外置双指;
+     * 一旦本帧丢失立即退出 (松手/退化姿态要跟手). */
+    if (two_raw) {
+        if (s_cst.confirm < 255) s_cst.confirm++;
+        if (s_cst.confirm >= CST_TWO_CONFIRM) s_cst.two_active = true;
+    } else {
+        s_cst.confirm = 0;
+        s_cst.two_active = false;
+    }
+
+    if (s_cst.two_active) {
+        pts[1].pressed = true;
+        pts[1].x = (int16_t)x2;
+        pts[1].y = (int16_t)y2;
+        pts[1].id = 1;
+        s_cst.last_x[1] = pts[1].x;
+        s_cst.last_y[1] = pts[1].y;
+        s_cst.last_valid[1] = true;
+        *count = 2;
+    } else {
+        pts[1].pressed = false;
+        pts[1].id = 0;
+        s_cst.last_valid[1] = false;
+        *count = 1;
+    }
     return true;
 }
 
@@ -506,6 +615,7 @@ static bool ft6236_read_points(tp_point_t pts[TP_MAX_POINTS], int *count) {
     for (int i = 0; i < cnt; i++) {
         const uint8_t *q = d + 1 + i * 4;
         pts[i].pressed = true;
+        pts[i].id = (uint8_t)i;
         pts[i].x = (int16_t)(((q[0] & 0x0F) << 8) | q[1]);
         pts[i].y = (int16_t)(((q[2] & 0x0F) << 8) | q[3]);
     }

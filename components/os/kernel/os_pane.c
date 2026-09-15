@@ -608,6 +608,59 @@ const char *os_pane_selected_path(os_pane_t *p) {
     return p->item_paths[p->sel_item];
 }
 
+/* 双指整屏翻页: dir_pages +1=上滑(向下翻看一屏), -1=下滑(向上回翻一屏).
+ * 为什么按"可视行数-1"翻而不是整 view_h: 保留 1 行上下文重叠, 用户能确认
+ * 新旧两屏衔接位置, 翻页不丢方向感. item_off 恒为 ROW_H 整数倍并夹紧到
+ * pane_max_off, 与按键/单指拖动共用同一套像素偏移模型, 三种输入互不打架.
+ * 返回 true=视口确实移动了; false=已到边界或内容不足一屏. */
+bool os_pane_page_scroll(os_pane_t *p, int dir_pages) {
+    if (!p || dir_pages == 0) return false;
+    int max_off = pane_max_off(p);
+    if (max_off <= 0) return false;                       /* 内容不足一屏, 无可滚 */
+
+    int view_h = pane_view_h(p);
+    int max_vis = view_h / ROW_H;
+    if (max_vis < 1) max_vis = 1;
+    int step = max_vis > 1 ? max_vis - 1 : 1;            /* 保留 1 行重叠 */
+
+    int first = p->item_off / ROW_H;
+    int first_new = first + dir_pages * step;
+    int first_max = max_off / ROW_H;                     /* 末屏起始行 */
+    if (first_new < 0) first_new = 0;
+    if (first_new > first_max) first_new = first_max;
+    if (first_new == first) return false;                /* 已在首/末屏 */
+
+    p->item_off = first_new * ROW_H;
+    p->item_scroll = first_new;
+
+    /* 把选中行移入新可视窗, 保证黑框高亮仍可见; 越界则落到新屏首行 */
+    int total = p->settings_mode ? p->settings_count : p->item_count;
+    int last_vis = first_new + max_vis - 1;
+    if (last_vis > total - 1) last_vis = total - 1;
+    if (p->sel_item < first_new || p->sel_item > last_vis)
+        p->sel_item = first_new;
+    p->focus = 1;                                        /* 翻的是右栏内容 */
+    return true;
+}
+
+/* 双栏列表模板的双指手势统一入口: 上/下滑=右栏整屏翻页并消费(不冒泡成 HOME);
+ * 双指点击及其它手势不消费, 交 main.c 全局兜底 (TAP=BACK). */
+bool os_pane_multi_gesture(ui_ctx_t *ctx, os_pane_t *p, const multi_gesture_evt_t *evt) {
+    if (!p || !evt) return false;
+    switch (evt->type) {
+    case MULTI_GESTURE_SWIPE_UP:
+        os_pane_page_scroll(p, +1);
+        if (ctx) ctx->needs_redraw = true;
+        return true;                                     /* 列表页固定消费上下滑 */
+    case MULTI_GESTURE_SWIPE_DOWN:
+        os_pane_page_scroll(p, -1);
+        if (ctx) ctx->needs_redraw = true;
+        return true;
+    default:
+        return false;                                    /* TAP 等 → 全局 BACK */
+    }
+}
+
 /* 每帧: 右栏触摸拖动滚动 (3.3 行为 — 拖动查看更多游戏/内容).
  * 平滑跟手: 记录按下时的起始 y 与 item_off, 手指每移动 1px 内容跟随 1px.
  * 输入层已区分: 大位移拖动手势不投递 tap, 不会误触发选中/启动. */

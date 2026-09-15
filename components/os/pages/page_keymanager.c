@@ -1222,6 +1222,18 @@ static void km_poll(ui_ctx_t *ctx) {
     }
 }
 
+/* 双指手势: PIN 弹窗/非列表态交还全局兜底; 删除确认框打开时仅吞掉上下滑
+ * (避免误触 HOME 退出页面), 双指点击仍落全局 BACK 以取消弹窗;
+ * 其余交给 os_pane 模板做列表整屏翻页 (设置区/密钥列表均支持) */
+static bool km_multi(ui_ctx_t *ctx, const multi_gesture_evt_t *evt) {
+    if (s_pin_open || s_state != KM_LIST) return false;
+    if (s_km_del_dlg &&
+        (evt->type == MULTI_GESTURE_SWIPE_UP || evt->type == MULTI_GESTURE_SWIPE_DOWN)) {
+        return true;
+    }
+    return os_pane_multi_gesture(ctx, &s_km_pane, evt);
+}
+
 /* ---- 进入/退出 ---- */
 static void km_enter(ui_ctx_t *ctx) {
     keyvault_init();
@@ -1271,6 +1283,7 @@ static const os_module_t s_mod_keymgr = {
     .action    = km_action,
     .touch     = km_touch,
     .poll      = km_poll,
+    .multi_gesture = km_multi,
     .fullscreen = false,
 };
 

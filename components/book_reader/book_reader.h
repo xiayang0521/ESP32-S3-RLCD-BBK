@@ -45,6 +45,27 @@ void book_reader_set_settings(bool knock, int sens, bool night, bool pagenum, in
                               int fontstyle, int fontsize, int margin, int lineh, int gap,
                               int indent);
 
+/* ==== 双指手势 (CST836U 两点触控) ====
+ * 设计原则: 捏合途中只做轻量字号预览 (不重新分页), 双指抬起时一次性提交重排,
+ * 避免逐档重建分页导致卡顿并跳回第 0 页。 */
+
+/* 捏合增量预览: steps>0 放大一档, <0 缩小一档, 一次可跨多档。
+ * 仅更新预览档位与画面 (夹取 0..3), 不切字体、不重新分页。
+ * 返回 true 表示当前处于可预览的阅读页 (调用方应刷新画面)。 */
+bool book_reader_pinch_font_delta(int steps);
+
+/* 捏合结束: 提交预览档位。若档位确有变化则切字体并尽量按原阅读位置重新分页,
+ * 通过 out_fontsize 回传最终生效档 (0..3), changed 回传是否真的改档。
+ * 返回 true 表示当前处于阅读页且已处理 (调用方应刷新画面并持久化字号)。 */
+bool book_reader_pinch_font_commit(int *out_fontsize, bool *changed);
+
+/* 双指左右滑翻章: dir<0=上一章, dir>0=下一章。无章节或已到边界时返回 false。
+ * 成功跳转返回 true。 */
+bool book_reader_goto_adjacent_chapter(int dir);
+
+/* 双指点击: 打开内部阅读菜单 (与长按 BOOT 同路径)。仅纯净阅读页可开, 返回是否已处理。 */
+bool book_reader_open_menu(void);
+
 /* V1.1.1: 阅读菜单交给外部 (os_dialog 列表模板) 呈现.
  * 打开阅读器时置 true → 阅读器内部不再自绘菜单, 由 page_book 用列表弹窗驱动. */
 void book_reader_set_external_menu(bool en);

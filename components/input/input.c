@@ -514,6 +514,205 @@ bool input_in_bottom_zone(int sx, int sy, int thick) {
     }
 }
 
+/* ==================== 双指手势识别器 (CST836U 两点触控) ====================
+ *
+ * 为什么独立于单指机而不是复用:
+ *   单指机 touch_gesture_poll 的状态/坐标全部围绕"一个点"建立, 硬塞第二点会
+ *   污染其按下/释放边沿。这里用独立状态机消费同一触摸缓存 s_touch_multi[],
+ *   并用一个抑制位 s_mg_suppress 在"双指活动期 + 抬起后余指武装期"完全屏蔽
+ *   单指机, 做到单/双指严格互斥: 第二指落下不会被当点击, 双指结束后残留的
+ *   一指也不会立刻触发 CONFIRM/长按, 直到两指全部抬起。
+ *
+ * 事件投递两条通道 (见 input.h):
+ *   - 捏合: 高频连续, 跟手调字号, 只走页面回调, 不锁存 (锁存会积压成灾);
+ *   - 离散手势 (双指点击/四向滑动): 先给页面回调, 页面未消费才锁存, 由主循环
+ *     做全局兜底 (双指点击=返回, 双指上滑=HOME)。
+ *
+ * 主导模式锁定: 一次双指会话内先达到捏合档位就锁 PINCH, 中点先移动到位就锁
+ *   SWIPE, 二者互斥, 防止缩放过程中轻微平移又误判成滑动。
+ *
+ * 灵敏优先档: 捏合 24px/档且可连续累积多档, 滑动 36px, 双指点击 350ms/30px。 */
+
+#define MULTI_PINCH_STEP_PX   24   /* 指距每变化 24 个屏幕像素 = 一个缩放档, 连续累积 */
+#define MULTI_SWIPE_MIN_PX    36   /* 双指中点移动超此距离锁定为滑动模式 */
+#define MULTI_TAP_MAX_MS      350  /* 双指点击: 按下到抬起的最长时长 */
+#define MULTI_TAP_MAX_PX      30   /* 双指点击: 中点允许的最大漂移 */
+
+typedef enum { MG_IDLE, MG_TWO } multi_state_t;
+
+/* mg_mode: 0=主导模式未定, 1=捏合, 2=滑动 (一次会话锁定其一) */
+#define MG_MODE_UNDECIDED  0
+#define MG_MODE_PINCH      1
+#define MG_MODE_SWIPE      2
+
+static multi_state_t    s_mg_state = MG_IDLE;
+static bool             s_mg_suppress = false;  /* 抑制单指机 (双指期 + 余指武装期) */
+static input_multi_cb_t s_mg_cb = NULL;
+static bool             s_mg_has_pending = false;
+static multi_gesture_evt_t s_mg_pending;        /* 页面未消费、待全局兜底的离散手势 */
+
+static struct {
+    int      cx0, cy0;     /* 双指落下时的中点 (屏幕逻辑坐标) */
+    int      dist0;        /* 落下时的指距, 用于主导模式判定 */
+    int      dist_acc;     /* 已消费到的指距基准 (捏合步进累积) */
+    int      cx, cy;       /* 最近一次中点 */
+    uint32_t t0;           /* 双指落下时刻 */
+    uint8_t  mode;         /* MG_MODE_* */
+} s_mg = {0};
+
+static int multi_abs(int v) { return (v < 0) ? -v : v; }
+
+/* 整数平方根 (牛顿迭代), 避免为算指距引入 libm 浮点依赖。v 必须 >= 0。 */
+static int multi_isqrt(int v) {
+    if (v <= 0) return 0;
+    int x = v;
+    for (;;) {
+        int nx = (x + v / x) / 2;
+        if (nx >= x) return x;   /* 收敛 (nx==x 或回摆) */
+        x = nx;
+    }
+}
+
+/* 把一个原始触点映射为屏幕逻辑坐标 (400x300 + 当前旋转方向)。 */
+static void multi_map_point(const tp_point_t *raw, int *sx, int *sy) {
+    int x, y;
+    touch_map_screen(raw->x, raw->y, &x, &y);
+    rotate_screen_coord(&x, &y);
+    *sx = x;
+    *sy = y;
+}
+
+/* 离散手势: 先交页面回调; 页面返回 true=已消费, 否则锁存给全局兜底。 */
+static void multi_emit_discrete(multi_gesture_t type, int cx, int cy) {
+    multi_gesture_evt_t evt = {
+        .type = type, .cx = cx, .cy = cy, .pinch_steps = 0,
+    };
+    bool consumed = s_mg_cb ? s_mg_cb(&evt) : false;
+    if (!consumed) {
+        s_mg_pending = evt;
+        s_mg_has_pending = true;
+    }
+}
+
+/* 捏合步进: 高频连续事件, 只实时通知页面 (阅读器跟手调字号), 不锁存。 */
+static void multi_emit_pinch(int steps, int cx, int cy) {
+    if (!s_mg_cb || steps == 0) return;
+    multi_gesture_evt_t evt = {
+        .type = MULTI_GESTURE_NONE, .cx = cx, .cy = cy, .pinch_steps = steps,
+    };
+    s_mg_cb(&evt);
+}
+
+/* 捏合会话结束: 仅实时通知页面一次性提交重排, 不锁存 (避免阅读器之外的场景
+ * 把一个"捏合结束"误当全局 BACK/HOME)。无回调时静默丢弃。 */
+static void multi_emit_pinch_end(int cx, int cy) {
+    if (!s_mg_cb) return;
+    multi_gesture_evt_t evt = {
+        .type = MULTI_GESTURE_PINCH_END, .cx = cx, .cy = cy, .pinch_steps = 0,
+    };
+    s_mg_cb(&evt);
+}
+
+/* 每帧驱动一次 (复用 touch_read_once 已刷新的缓存, 自身不读芯片)。
+ * 必须在 touch_gesture_poll 的单指状态机之前调用。 */
+static void multi_gesture_poll(void) {
+    bool two = (s_touch_cached_count >= 2) &&
+               s_touch_multi[0].pressed && s_touch_multi[1].pressed;
+
+    if (!two) {
+        if (s_mg_state == MG_TWO) {
+            /* 双指会话结束: 依据整段会话的中点位移/时长汇总一次性离散手势。 */
+            int mdx = s_mg.cx - s_mg.cx0;
+            int mdy = s_mg.cy - s_mg.cy0;
+            int adx = multi_abs(mdx);
+            int ady = multi_abs(mdy);
+            uint32_t dt = now_ms() - s_mg.t0;
+            if (s_mg.mode == MG_MODE_PINCH) {
+                /* 已锁定捏合: 无论中点是否漂移, 都只发捏合结束 (提交重排),
+                 * 不再判定滑动/点击, 保证一次会话手势语义唯一。 */
+                multi_emit_pinch_end(s_mg.cx, s_mg.cy);
+            } else if (s_mg.mode == MG_MODE_SWIPE ||
+                       adx >= MULTI_SWIPE_MIN_PX || ady >= MULTI_SWIPE_MIN_PX) {
+                /* 主轴投影定方向: 横向位移占优给左右, 否则给上下。 */
+                multi_gesture_t g;
+                if (adx >= ady)
+                    g = (mdx < 0) ? MULTI_GESTURE_SWIPE_LEFT
+                                  : MULTI_GESTURE_SWIPE_RIGHT;
+                else
+                    g = (mdy < 0) ? MULTI_GESTURE_SWIPE_UP
+                                  : MULTI_GESTURE_SWIPE_DOWN;
+                multi_emit_discrete(g, s_mg.cx0, s_mg.cy0);
+            } else if (dt <= MULTI_TAP_MAX_MS &&
+                       adx < MULTI_TAP_MAX_PX && ady < MULTI_TAP_MAX_PX) {
+                /* 两指几乎不动且短时按下 -> 双指点击 (捏合过的不算点击)。 */
+                multi_emit_discrete(MULTI_GESTURE_TAP, s_mg.cx0, s_mg.cy0);
+            }
+            s_mg_state = MG_IDLE;
+        }
+        /* 余指武装期: 双指结束后只要仍有一指按住就继续抑制单指; 全抬才解除。
+         * 未进入过双指的普通单指场景这里恒为 false, 不影响正常单指。 */
+        s_mg_suppress = (s_touch_cached_count >= 1) && s_touch_multi[0].pressed;
+        return;
+    }
+
+    /* 两点都在: 映射屏幕逻辑坐标, 计算中点与指距。 */
+    int x0, y0, x1, y1;
+    multi_map_point(&s_touch_multi[0], &x0, &y0);
+    multi_map_point(&s_touch_multi[1], &x1, &y1);
+    int cx = (x0 + x1) / 2;
+    int cy = (y0 + y1) / 2;
+    int ddx = x0 - x1, ddy = y0 - y1;
+    int dist = multi_isqrt(ddx * ddx + ddy * ddy);
+
+    s_last_any_ms = now_ms();   /* 双指操作视为活动, 刷新统一休眠时钟 */
+
+    if (s_mg_state == MG_IDLE) {
+        /* 进入双指: 记录基准, 复位单指机并武装抑制。 */
+        s_mg_state = MG_TWO;
+        s_mg_suppress = true;
+        s_mg.cx0 = s_mg.cx = cx;
+        s_mg.cy0 = s_mg.cy = cy;
+        s_mg.dist0 = s_mg.dist_acc = dist;
+        s_mg.t0 = now_ms();
+        s_mg.mode = MG_MODE_UNDECIDED;
+        s_tg_state = TG_IDLE;        /* 第二指落下: 强制中断进行中的单指手势 */
+        s_tg_long_fired = false;
+        return;
+    }
+
+    /* MG_TWO 持续: 更新中点, 做主导模式锁定。 */
+    s_mg.cx = cx;
+    s_mg.cy = cy;
+    int mdx = cx - s_mg.cx0, mdy = cy - s_mg.cy0;
+    int adx = multi_abs(mdx), ady = multi_abs(mdy);
+    if (s_mg.mode == MG_MODE_UNDECIDED) {
+        if (multi_abs(dist - s_mg.dist0) >= MULTI_PINCH_STEP_PX)
+            s_mg.mode = MG_MODE_PINCH;
+        else if (adx >= MULTI_SWIPE_MIN_PX || ady >= MULTI_SWIPE_MIN_PX)
+            s_mg.mode = MG_MODE_SWIPE;
+    }
+    if (s_mg.mode == MG_MODE_PINCH) {
+        /* 连续步进: 相对上次已消费基准的指距增量 / 每档像素, 一次可跨多档。 */
+        int steps = (dist - s_mg.dist_acc) / MULTI_PINCH_STEP_PX;
+        if (steps != 0) {
+            s_mg.dist_acc += steps * MULTI_PINCH_STEP_PX;
+            multi_emit_pinch(steps, cx, cy);
+        }
+    }
+    /* 滑动模式仅持续记录中点, 方向在会话结束时一次性判定 (避免中途反向连发)。 */
+}
+
+void input_set_multi_gesture_cb(input_multi_cb_t cb) { s_mg_cb = cb; }
+
+bool input_take_multi_gesture(multi_gesture_evt_t *evt) {
+    if (!s_mg_has_pending) return false;
+    if (evt) *evt = s_mg_pending;
+    s_mg_has_pending = false;
+    return true;
+}
+
+bool input_multi_active(void) { return s_mg_suppress; }
+
 static menu_action_t touch_gesture_poll(void) {
     /* 休眠禁触屏 (统一触摸手势入口): input_get_action 与 input_get_touch_action
      * 都经此处理触摸, 屏保(壁纸)激活时一律不产生手势/不访问触摸/不刷新 s_last_any_ms,
@@ -525,6 +724,13 @@ static menu_action_t touch_gesture_poll(void) {
     s_tap_x = s_tap_y = -1;
     tp_point_t pt;
     touch_read_once(&pt);
+    /* 先驱动双指识别器 (复用同一触摸缓存, 不额外读芯片):
+     * 双指活动期 / 抬起后余指武装期完全屏蔽单指机, 做到单双指严格互斥。 */
+    multi_gesture_poll();
+    if (s_mg_suppress) {
+        s_touch_down = false;   /* 双指期间不向单指按压消费者暴露点0, 防误触与误按压反馈 */
+        return MENU_ACTION_NONE;
+    }
     /* 更新实时触摸屏幕坐标 (供主菜单跟手拖动读取) */
     s_touch_down = pt.pressed;
     if (pt.pressed) {
@@ -960,6 +1166,7 @@ void input_get_touch_multi(tp_point_t pts[TP_MAX_POINTS], int *count) {
         pts[i].pressed = true;
         pts[i].x = (int16_t)sx;
         pts[i].y = (int16_t)sy;
+        pts[i].id = s_touch_multi[i].id;   /* 透传触点编号 (0/1), 供下游区分两点 */
     }
 }
 

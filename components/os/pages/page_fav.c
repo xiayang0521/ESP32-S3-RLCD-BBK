@@ -973,6 +973,48 @@ static void fav_poll(ui_ctx_t*ctx){
     } else { s_press_on=false; s_press=false; }
 }
 
+/* 右栏可视下缘: 与 main_render 的可见裁剪条件 (y<=S_H-10) 保持一致 */
+#define FAV_VIEW_BOTTOM (S_H - 10)
+
+/* 双指上下滑: 右栏整屏翻页 (保留 1 行重叠、对齐行高、夹取末屏, 并把选中行移入视窗).
+ * 为什么自写而不复用 os_pane: 右栏是自绘列表 (设置行高40/收藏行高52),
+ * 滚动量记在自有 s_scroll, 与模板的 item_off 无关.
+ * 返回值: 列表态固定消费上下滑 (到边界也不冒泡 HOME);
+ * PIN 未解锁/编辑抽屉打开时交还全局, 使双指点击=BACK 仍可关抽屉 */
+static bool fav_multi(ui_ctx_t *ctx, const multi_gesture_evt_t *evt) {
+    if (!s_authed || s_drawer >= 0) return false;
+    if (evt->type != MULTI_GESTURE_SWIPE_UP && evt->type != MULTI_GESTURE_SWIPE_DOWN)
+        return false;
+    if (s_fav_import_dlg) return true;   /* 导入确认框打开: 吞掉上下滑防误退, 点击仍落 BACK 取消 */
+    int row_h, top, total;
+    if (s_cat < 0) { row_h = 40; top = HDR_H + 4; total = 5; }
+    else {
+        row_h = 52;
+        top   = HDR_H + 2;
+        total = fav_max();
+        if (total == 0) total = 1;       /* 空分类的「＋添加收藏」占位行 */
+    }
+    int view_h = FAV_VIEW_BOTTOM - top;
+    int max_scroll = total * row_h - view_h;
+    if (max_scroll <= 0) return true;    /* 内容不足一屏: 消费但无需滚动 */
+    int max_vis = view_h / row_h;
+    if (max_vis < 1) max_vis = 1;
+    int step_rows = max_vis > 1 ? max_vis - 1 : 1;
+    int first = s_scroll / row_h;
+    int first_new = first + ((evt->type == MULTI_GESTURE_SWIPE_UP) ? step_rows : -step_rows);
+    int first_max = max_scroll / row_h;  /* 末屏首行, 夹取依据 */
+    if (first_new < 0) first_new = 0;
+    if (first_new > first_max) first_new = first_max;
+    if (first_new != first) {
+        s_scroll = first_new * row_h;
+        int last_vis = first_new + max_vis - 1;
+        if (last_vis > total - 1) last_vis = total - 1;
+        if (s_sel < first_new || s_sel > last_vis) s_sel = first_new;
+        redraw(ctx);
+    }
+    return true;
+}
+
 /* ===== 进/出 ===== */
 static void fav_enter(ui_ctx_t*ctx){
     s_lan_pending = false; s_lan_toast_pending = false; s_fav_import_dlg = false;
@@ -998,6 +1040,7 @@ static os_module_t s_mod_fav={
     .name="fav", .page_id=OS_PAGE_FAV,
     .on_enter=fav_enter, .on_exit=fav_exit,
     .render=render, .action=fav_action, .touch=fav_touch, .poll=fav_poll,
+    .multi_gesture=fav_multi,
     .fullscreen=false,   /* 顶部显示正常状态栏 */
 };
 void os_page_fav_register(void){ os_register(&s_mod_fav); }

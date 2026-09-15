@@ -344,6 +344,11 @@ static void pane_poll(ui_ctx_t *ctx, os_pane_t *p) {
     os_pane_poll(ctx, p);
 }
 
+/* 双指: 各引擎列表共用模板整屏翻页 (上/下滑消费, 点击交全局 BACK) */
+static bool pane_multi(ui_ctx_t *ctx, os_pane_t *p, const multi_gesture_evt_t *evt) {
+    return os_pane_multi_gesture(ctx, p, evt);
+}
+
 /* ==== 引擎运行循环 (task 型引擎 GB/GBC/NES): 每帧喂 joypad + 检测返回 → 确认退出 ==== */
 typedef struct {
     void (*set_joypad)(uint8_t);
@@ -590,6 +595,7 @@ static void gb_render(ui_ctx_t *ctx)   { pane_render(ctx, &s_gb_p); }
 static void gb_action(ui_ctx_t *ctx, os_action_t a) { pane_action(ctx, &s_gb_p, a); }
 static bool gb_touch(ui_ctx_t *ctx, int x, int y)   { return pane_touch(ctx, &s_gb_p, x, y); }
 static void gb_poll(ui_ctx_t *ctx)     { pane_poll(ctx, &s_gb_p); }
+static bool gb_multi(ui_ctx_t *ctx, const multi_gesture_evt_t *evt) { return pane_multi(ctx, &s_gb_p, evt); }
 
 static const os_module_t s_mod_gb = {
     .name       = "engine_gb",
@@ -599,6 +605,7 @@ static const os_module_t s_mod_gb = {
     .action     = gb_action,
     .touch      = gb_touch,
     .poll       = gb_poll,
+    .multi_gesture = gb_multi,
     .fullscreen = false,
 };
 
@@ -612,6 +619,7 @@ static void gbc_render(ui_ctx_t *ctx)   { pane_render(ctx, &s_gbc_p); }
 static void gbc_action(ui_ctx_t *ctx, os_action_t a) { pane_action(ctx, &s_gbc_p, a); }
 static bool gbc_touch(ui_ctx_t *ctx, int x, int y)   { return pane_touch(ctx, &s_gbc_p, x, y); }
 static void gbc_poll(ui_ctx_t *ctx)     { pane_poll(ctx, &s_gbc_p); }
+static bool gbc_multi(ui_ctx_t *ctx, const multi_gesture_evt_t *evt) { return pane_multi(ctx, &s_gbc_p, evt); }
 
 static const os_module_t s_mod_gbc = {
     .name       = "engine_gbc",
@@ -621,6 +629,7 @@ static const os_module_t s_mod_gbc = {
     .action     = gbc_action,
     .touch      = gbc_touch,
     .poll       = gbc_poll,
+    .multi_gesture = gbc_multi,
     .fullscreen = false,
 };
 
@@ -634,6 +643,7 @@ static void nes_render(ui_ctx_t *ctx)   { pane_render(ctx, &s_nes_p); }
 static void nes_action(ui_ctx_t *ctx, os_action_t a) { pane_action(ctx, &s_nes_p, a); }
 static bool nes_touch(ui_ctx_t *ctx, int x, int y)   { return pane_touch(ctx, &s_nes_p, x, y); }
 static void nes_poll(ui_ctx_t *ctx)     { pane_poll(ctx, &s_nes_p); }
+static bool nes_multi(ui_ctx_t *ctx, const multi_gesture_evt_t *evt) { return pane_multi(ctx, &s_nes_p, evt); }
 
 static const os_module_t s_mod_nes = {
     .name       = "engine_nes",
@@ -643,6 +653,7 @@ static const os_module_t s_mod_nes = {
     .action     = nes_action,
     .touch      = nes_touch,
     .poll       = nes_poll,
+    .multi_gesture = nes_multi,
     .fullscreen = false,
 };
 
@@ -677,6 +688,7 @@ static void md_render(ui_ctx_t *ctx)   { pane_render(ctx, &s_md_p); }
 static void md_action(ui_ctx_t *ctx, os_action_t a) { pane_action(ctx, &s_md_p, a); }
 static bool md_touch(ui_ctx_t *ctx, int x, int y)   { return pane_touch(ctx, &s_md_p, x, y); }
 static void md_poll(ui_ctx_t *ctx)     { pane_poll(ctx, &s_md_p); }
+static bool md_multi(ui_ctx_t *ctx, const multi_gesture_evt_t *evt) { return pane_multi(ctx, &s_md_p, evt); }
 
 static const os_module_t s_mod_md = {
     .name       = "engine_md",
@@ -686,6 +698,7 @@ static const os_module_t s_mod_md = {
     .action     = md_action,
     .touch      = md_touch,
     .poll       = md_poll,
+    .multi_gesture = md_multi,
     .fullscreen = false,
 };
 
@@ -720,6 +733,7 @@ static void sms_render(ui_ctx_t *ctx)   { pane_render(ctx, &s_sms_p); }
 static void sms_action(ui_ctx_t *ctx, os_action_t a) { pane_action(ctx, &s_sms_p, a); }
 static bool sms_touch(ui_ctx_t *ctx, int x, int y)   { return pane_touch(ctx, &s_sms_p, x, y); }
 static void sms_poll(ui_ctx_t *ctx)     { pane_poll(ctx, &s_sms_p); }
+static bool sms_multi(ui_ctx_t *ctx, const multi_gesture_evt_t *evt) { return pane_multi(ctx, &s_sms_p, evt); }
 
 static const os_module_t s_mod_sms = {
     .name       = "engine_sms",
@@ -729,6 +743,7 @@ static const os_module_t s_mod_sms = {
     .action     = sms_action,
     .touch      = sms_touch,
     .poll       = sms_poll,
+    .multi_gesture = sms_multi,
     .fullscreen = false,
 };
 
@@ -745,6 +760,7 @@ static void lavax_render(ui_ctx_t *ctx)   { pane_render(ctx, &s_lav_p); }
 static void lavax_action(ui_ctx_t *ctx, os_action_t a) { pane_action(ctx, &s_lav_p, a); }
 static bool lavax_touch(ui_ctx_t *ctx, int x, int y)   { return pane_touch(ctx, &s_lav_p, x, y); }
 static void lavax_poll(ui_ctx_t *ctx)     { pane_poll(ctx, &s_lav_p); }
+static bool lavax_multi(ui_ctx_t *ctx, const multi_gesture_evt_t *evt) { return pane_multi(ctx, &s_lav_p, evt); }
 
 static const os_module_t s_mod_lavax = {
     .name       = "engine_lavax",
@@ -754,6 +770,7 @@ static const os_module_t s_mod_lavax = {
     .action     = lavax_action,
     .touch      = lavax_touch,
     .poll       = lavax_poll,
+    .multi_gesture = lavax_multi,
     .fullscreen = false,
 };
 
@@ -767,6 +784,7 @@ static void vpet_render(ui_ctx_t *ctx)   { pane_render(ctx, &s_vpet_p); }
 static void vpet_action(ui_ctx_t *ctx, os_action_t a) { pane_action(ctx, &s_vpet_p, a); }
 static bool vpet_touch(ui_ctx_t *ctx, int x, int y)   { return pane_touch(ctx, &s_vpet_p, x, y); }
 static void vpet_poll(ui_ctx_t *ctx)     { pane_poll(ctx, &s_vpet_p); }
+static bool vpet_multi(ui_ctx_t *ctx, const multi_gesture_evt_t *evt) { return pane_multi(ctx, &s_vpet_p, evt); }
 
 static const os_module_t s_mod_vpet = {
     .name       = "engine_vpet",
@@ -776,6 +794,7 @@ static const os_module_t s_mod_vpet = {
     .action     = vpet_action,
     .touch      = vpet_touch,
     .poll       = vpet_poll,
+    .multi_gesture = vpet_multi,
     .fullscreen = false,
 };
 
@@ -809,6 +828,7 @@ static void ab_render(ui_ctx_t *ctx)   { pane_render(ctx, &s_ab_p); }
 static void ab_action(ui_ctx_t *ctx, os_action_t a) { pane_action(ctx, &s_ab_p, a); }
 static bool ab_touch(ui_ctx_t *ctx, int x, int y)   { return pane_touch(ctx, &s_ab_p, x, y); }
 static void ab_poll(ui_ctx_t *ctx)     { pane_poll(ctx, &s_ab_p); }
+static bool ab_multi(ui_ctx_t *ctx, const multi_gesture_evt_t *evt) { return pane_multi(ctx, &s_ab_p, evt); }
 
 static const os_module_t s_mod_arduboy = {
     .name       = "engine_arduboy",
@@ -818,6 +838,7 @@ static const os_module_t s_mod_arduboy = {
     .action     = ab_action,
     .touch      = ab_touch,
     .poll       = ab_poll,
+    .multi_gesture = ab_multi,
     .fullscreen = false,
 };
 

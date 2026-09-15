@@ -21,6 +21,7 @@
 #define OS_H
 
 #include "st7305.h"
+#include "input.h"      /* multi_gesture_evt_t: 页面双指手势契约 */
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -115,6 +116,10 @@ struct os_module {
     void (*action)(ui_ctx_t *ctx, os_action_t a);   /* 按键: 模块内部处理 */
     bool (*touch)(ui_ctx_t *ctx, int x, int y);     /* 触摸 hit-test: true=命中消费 */
     void (*poll)(ui_ctx_t *ctx);      /* 每帧后台轮询(可选). 可能为 NULL */
+    /* 双指手势 (可选, NULL=不消费): 由内核常驻回调按当前页路由.
+     * 返回 true=页面已消费 (如列表翻屏, 不再冒泡成全局 HOME/BACK);
+     * 返回 false=交还输入层锁存, 最终落到 main.c 全局兜底 (TAP=BACK/上滑=HOME). */
+    bool (*multi_gesture)(ui_ctx_t *ctx, const multi_gesture_evt_t *evt);
 
     bool modal;                       /* 是否模态覆盖页 (是则不重绘底层) */
     bool fullscreen;                  /* 是否全屏(隐藏状态栏); 游戏/应用页=true */

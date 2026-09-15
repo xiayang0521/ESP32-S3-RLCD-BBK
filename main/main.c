@@ -286,6 +286,19 @@ static void os_shell_loop(ui_ctx_t *ctx) {
                 os_handle_action(ctx, action);
             }
         }
+        /* 全局双指手势兜底: 页面回调未消费的离散手势在此取走。
+         * 映射遵循 C 档约定: 双指点击=返回, 双指上滑=回桌面(HOME)。
+         * 放在 action 块之后, 保证页面优先 (阅读器翻章等) 且每帧只处理一次。 */
+        multi_gesture_evt_t mgev;
+        if (input_take_multi_gesture(&mgev)) {
+            os_action_t mact = OS_ACTION_NONE;
+            if (mgev.type == MULTI_GESTURE_TAP)            mact = OS_ACTION_BACK;
+            else if (mgev.type == MULTI_GESTURE_SWIPE_UP)  mact = OS_ACTION_HOME;
+            if (mact != OS_ACTION_NONE) {
+                last_input_ms = now_ms;
+                os_handle_action(ctx, mact);
+            }
+        }
         /* 触摸按下也算输入 (拖动/绘图等持续手势) */
         { int tx, ty; if (input_get_touch_pos(&tx, &ty)) last_input_ms = now_ms; }
         /* 游戏 joypad 活动: 任意游戏界面 (GB/NES/文曲星/ArduBoy) 有键按住即视为活动.

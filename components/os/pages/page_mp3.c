@@ -43,6 +43,10 @@ static int  s_count   = 0;
 static int  s_current = 0;
 static int  s_sel     = 0;         /* 列表选中 */
 static bool s_in_player = false;   /* 已在播放 */
+/* 双指整屏滚动的独立歌单视口 (首行索引). 为什么独立: 翻页不应移动正在播放/选中的曲,
+ * 最终视口取 max(高亮跟随偏移, 本值), 按键选曲时自动归 0 跟随, 双指浏览时保持不跳 */
+static int  s_list_top = 0;
+static uint32_t s_vol_hint_t0 = 0; /* 捏合调音量 toast 限频 (ms) */
 static int  s_last_cd_angle = 0;
 static bool s_scanned = false;
 
@@ -102,6 +106,15 @@ static uint32_t s_loop_tip_t0 = 0;   /* 废弃: 循环切换提示改用 os_dial
 #define MP3_VOL_TOUCH     32            /* 触摸热区左右宽度 */
 /* 播放列表: 底部止于进度条上方 (留 4px) */
 #define MP3_LIST_BOTTOM  (MP3_BAR_Y - 4)
+/* 左栏歌单视口几何 (render / touch / 双指翻页三处共用, 避免尺寸漂移).
+ * 可视行数 = (278-28)/26 = 9; 整屏翻动保留 1 行重叠, 故步长 = 8 行 */
+#define MP3_LIST_Y       28
+#define MP3_LIST_LINE_H  26
+#define MP3_LIST_VISIBLE ((MP3_LIST_BOTTOM - MP3_LIST_Y) / MP3_LIST_LINE_H)
+#define MP3_PAGE_STEP    (MP3_LIST_VISIBLE - 1)
+/* 捏合每档 (双指间距 24px) 对应的音量百分比步进 */
+#define MP3_PINCH_VOL_STEP 8
+#define MP3_VOL_HINT_MS    200   /* 捏合音量 toast 限频间隔 */
 
 /* 屏幕 x -> 进度千分比 (0..1000) */
 static int mp3_x_to_progress(int x)
@@ -255,6 +268,7 @@ static int mp3_play_at(int idx) {
     int ret = audio_player_play(path);
     if (ret == 0) {
         s_in_player = true;
+        s_list_top = 0;   /* 任何路径切歌都回到跟随高亮的视口, 避免双指浏览后画面跳离新曲 */
     } else {
         ESP_LOGE(TAG, "播放失败: %s", path);
     }
@@ -265,6 +279,19 @@ static int mp3_play_at(int idx) {
 static int mp3_list_scroll(int highlight_idx, int max_visible) {
     int scroll = 0;
     if (highlight_idx >= max_visible - 1) scroll = highlight_idx - max_visible + 2;
+    if (scroll < 0) scroll = 0;
+    return scroll;
+}
+
+/* 有效视口首行 = max(高亮跟随偏移, 双指翻页偏移), 再夹到合法上界.
+ * 为什么取 max: 按键选曲要求高亮常驻可视; 双指浏览要求画面不被高亮强行拉回.
+ * 二者都是"向下位移"语义, 取较大值即可同时满足; 切歌时 s_list_top 已归 0. */
+static int mp3_effective_scroll(int highlight_idx, int max_visible) {
+    int scroll = mp3_list_scroll(highlight_idx, max_visible);
+    if (scroll < s_list_top) scroll = s_list_top;
+    int top_max = s_count - max_visible;   /* 歌曲数不足一屏时为负, 此时只允许首屏 */
+    if (top_max < 0) top_max = 0;
+    if (scroll > top_max) scroll = top_max;
     if (scroll < 0) scroll = 0;
     return scroll;
 }
@@ -469,11 +496,11 @@ static void p_mp3_render(ui_ctx_t *ctx)
     if (highlight_idx < 0) highlight_idx = 0;
 
     /* === 左菜单: 播放列表 === */
-    int list_x = 0, list_w = 195, list_y = 28;
+    int list_x = 0, list_w = 195, list_y = MP3_LIST_Y;
     int list_h = MP3_LIST_BOTTOM - list_y;   /* 底部让给循环模式按钮 */
-    int line_h = 26;
+    int line_h = MP3_LIST_LINE_H;
     int max_visible = list_h / line_h;
-    int scroll = mp3_list_scroll(highlight_idx, max_visible);
+    int scroll = mp3_effective_scroll(highlight_idx, max_visible);
 
     for (int i = 0; i < s_count && i < max_visible; i++) {
         int idx = i + scroll;
@@ -626,12 +653,14 @@ static void p_mp3_action(ui_ctx_t *ctx, os_action_t a)
         if (s_count == 0) break;
         s_sel = (s_sel - 1 + s_count) % s_count;
         if (!s_in_player) s_current = s_sel;
+        s_list_top = 0;   /* 按键选曲: 视口回到跟随高亮, 与双指浏览态解耦 */
         ctx->needs_redraw = true;
         break;
     case OS_ACTION_DOWN:
         if (s_count == 0) break;
         s_sel = (s_sel + 1) % s_count;
         if (!s_in_player) s_current = s_sel;
+        s_list_top = 0;
         ctx->needs_redraw = true;
         break;
     case OS_ACTION_LEFT:
@@ -749,7 +778,7 @@ static void p_mp3_poll(ui_ctx_t *ctx)
 static bool p_mp3_touch(ui_ctx_t *ctx, int x, int y)
 {
     const int SCREEN_W = UI_SCREEN_W;
-    const int list_x = 0, list_w = 195, list_y = 28, line_h = 26;
+    const int list_x = 0, list_w = 195, list_y = MP3_LIST_Y, line_h = MP3_LIST_LINE_H;
 
     /* 音量滑条区 (已打开): 点滑条圆点附近=拖动 (poll 持续调), 点图标区域外空白=收起 */
     if (s_vol_slider) {
@@ -826,7 +855,7 @@ static bool p_mp3_touch(ui_ctx_t *ctx, int x, int y)
             int highlight_idx = s_in_player ? s_current : s_sel;
             if (highlight_idx < 0) highlight_idx = 0;
             int max_visible = (MP3_LIST_BOTTOM - list_y) / line_h;
-            int scroll = mp3_list_scroll(highlight_idx, max_visible);
+            int scroll = mp3_effective_scroll(highlight_idx, max_visible);
             int idx = row + scroll;
             if (idx >= 0 && idx < s_count) {
                 s_sel = idx;
@@ -855,6 +884,69 @@ static bool p_mp3_touch(ui_ctx_t *ctx, int x, int y)
     return true;
 }
 
+/* ============ 双指手势 ============ */
+/* 三类实用手势 (均消费, 不冒泡全局 HOME/BACK):
+ *   左/右滑 = 上一首/下一首 (与进度条上方图标按钮同一条切歌路径);
+ *   上/下滑 = 左栏歌单整屏翻动 (保留 1 行重叠), 不动正在播放的曲;
+ *   捏合   = 调音量 (张开 +8%/档, 收拢 -8%/档, 0..100 夹取, toast 百分比).
+ * 双指点击不处理 (return false) → 落全局 BACK → 弹现有退出三选框. */
+static bool p_mp3_multi(ui_ctx_t *ctx, const multi_gesture_evt_t *evt)
+{
+    if (!ctx || !evt) return false;
+
+    /* --- 捏合: 连续步进事件 (type=NONE 但带 pinch_steps) 实时调音量 --- */
+    if (evt->type == MULTI_GESTURE_NONE && evt->pinch_steps != 0) {
+        int vol = audio_player_get_volume() + evt->pinch_steps * MP3_PINCH_VOL_STEP;
+        if (vol < 0) vol = 0;
+        if (vol > 100) vol = 100;
+        audio_player_set_volume(vol);
+        /* toast 200ms 限频: 连续捏合每帧都来事件, 不重开弹窗避免计时被反复刷新 */
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        if ((uint32_t)(now_ms - s_vol_hint_t0) >= MP3_VOL_HINT_MS) {
+            s_vol_hint_t0 = now_ms;
+            char hint[24];
+            snprintf(hint, sizeof(hint),
+                     "\xe9\x9f\xb3\xe9\x87\x8f %d%%", vol);   /* 音量 NN% */
+            os_dialog_toast_ms(ctx, hint, MP3_VOL_HINT_MS);
+        }
+        ctx->needs_redraw = true;   /* 音量滑条圆点/状态刷新 */
+        return true;
+    }
+    if (evt->type == MULTI_GESTURE_PINCH_END) {
+        return true;                /* 抬手空提交: 消费即可, 音量已实时生效 */
+    }
+
+    /* --- 左右滑: 切上一首/下一首 (方向与图标按钮一致: 右=下一首) --- */
+    if (evt->type == MULTI_GESTURE_SWIPE_LEFT || evt->type == MULTI_GESTURE_SWIPE_RIGHT) {
+        if (s_count > 0) {
+            int next = (evt->type == MULTI_GESTURE_SWIPE_RIGHT)
+                       ? (s_current + 1) % s_count
+                       : (s_current - 1 + s_count) % s_count;
+            audio_player_stop();
+            mp3_play_at(next);      /* 内部成功时 s_list_top 归 0, 视口跟随新曲 */
+            s_sel = s_current;
+            ctx->needs_redraw = true;
+        }
+        return true;                /* 0 首歌也消费, 避免冒泡成无意义的全局手势 */
+    }
+
+    /* --- 上下滑: 歌单整屏翻动, 只改独立视口 s_list_top, 不动高亮/播放态 --- */
+    if (evt->type == MULTI_GESTURE_SWIPE_UP || evt->type == MULTI_GESTURE_SWIPE_DOWN) {
+        int top_max = s_count - MP3_LIST_VISIBLE;
+        if (top_max < 0) top_max = 0;
+        if (evt->type == MULTI_GESTURE_SWIPE_UP)
+            s_list_top += MP3_PAGE_STEP;
+        else
+            s_list_top -= MP3_PAGE_STEP;
+        if (s_list_top < 0) s_list_top = 0;
+        if (s_list_top > top_max) s_list_top = top_max;
+        ctx->needs_redraw = true;
+        return true;                /* 固定消费: 列表页的上下滑不冒泡成 HOME */
+    }
+
+    return false;   /* TAP 等 → 全局兜底 (BACK 弹退出框) */
+}
+
 /* ============ 模块契约 ============ */
 static const os_module_t s_mod_mp3 = {
     .name      = "mp3",
@@ -863,6 +955,7 @@ static const os_module_t s_mod_mp3 = {
     .action    = p_mp3_action,
     .poll      = p_mp3_poll,
     .touch     = p_mp3_touch,
+    .multi_gesture = p_mp3_multi,
     .fullscreen = false,
 };
 

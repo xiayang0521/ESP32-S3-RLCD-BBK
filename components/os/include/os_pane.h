@@ -106,6 +106,12 @@ bool os_pane_action(ui_ctx_t *ctx, os_pane_t *p, os_action_t a);
 bool os_pane_touch(ui_ctx_t *ctx, os_pane_t *p, int x, int y);
 /* 每帧轮询: 右栏触摸拖动滚动 (查看更多项, 3.3 行为) */
 void os_pane_poll(ui_ctx_t *ctx, os_pane_t *p);
+/* 双指整屏翻页: dir_pages +1=上滑向下翻一屏, -1=下滑向上回翻一屏 (保留1行重叠).
+ * 返回 true=视口确实移动. 供需要编程式翻屏的页面调用. */
+bool os_pane_page_scroll(os_pane_t *p, int dir_pages);
+/* 双指手势统一入口: 双指上/下滑=右栏整屏翻页(消费,不冒泡HOME), 其它手势返回false交全局BACK.
+ * 用法: 在页面 os_module.multi_gesture 里 return os_pane_multi_gesture(ctx, &s_pane, evt); */
+bool os_pane_multi_gesture(ui_ctx_t *ctx, os_pane_t *p, const multi_gesture_evt_t *evt);
 /* 当前右栏选中项完整路径 (未选中返回 NULL) */
 const char *os_pane_selected_path(os_pane_t *p);
 
