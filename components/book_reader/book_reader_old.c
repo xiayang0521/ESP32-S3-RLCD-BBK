@@ -162,8 +162,17 @@ static bool         s_pagenum = false;    /* 默认不显示进度信息 */
 static uint32_t     s_open_tick_ms = 0;   /* 本次阅读会话起始时间 (ms, 用于"已读时长") */
 static uint8_t      s_fontstyle = 0;       /* 0=仿宋 1=黑体(菜单字体) */
 static uint8_t      s_fontsize = 1;       /* 字号档 0=20 1=24 2=28 3=32 (默认 24 档=1) */
+#define BOOK_FONT_LEVELS 4               /* 字号档总数 (0..3) */
+#define BOOK_FONT_DEFAULT 1              /* 默认档 (24px) */
 /* 字号档 → 实际像素 (font_book_select 按像素渲染/缩放) */
-static int book_reader_size_px(int id) { static const int t[4] = {20,24,28,32}; return t[(id<0)?1:(id>3)?3:id]; }
+static int book_reader_size_px(int id) {
+    static const int t[BOOK_FONT_LEVELS] = {20, 24, 28, 32};
+    return t[(id < 0) ? BOOK_FONT_DEFAULT : (id >= BOOK_FONT_LEVELS) ? BOOK_FONT_DEFAULT : id];
+}
+/* 字号档夹取到合法区间, 供双指预览/提交共用, 避免散落边界判断 */
+static int book_font_clamp(int id) {
+    return (id < 0) ? 0 : (id >= BOOK_FONT_LEVELS) ? BOOK_FONT_LEVELS - 1 : id;
+}
 static uint8_t      s_margin_id = 1;      /* 0=窄 1=中 2=宽 */
 static uint8_t      s_lineh_id = 1;       /* 0=紧凑 1=标准 2=宽松 */
 static uint8_t      s_gap_id = 0;         /* 0=标准 1=宽松 */
@@ -172,6 +181,13 @@ static bool         s_inverted = false;
 static st7305_handle_t *s_lcd = NULL;
 static uint8_t     *s_rot_buf = NULL;     /* 180° 旋转输出备用缓冲 */
 static uint8_t     *s_pfb = NULL;         /* 竖屏逻辑缓冲 (1bpp 行序) */
+
+/* === 双指捏合字号预览 ===
+ * 为什么捏合途中只预览不重排: book_restart_index 会停后台任务、释放分页/章节表并
+ * 重建, 代价高且会把 s_page 置 0; 逐档重排既卡顿又丢阅读位置。因此捏合期间只更新
+ * s_pinch_preview 并叠加浮层, 抬手 commit 时才切字体+重排一次。 */
+static bool         s_pinch_active = false;  /* 是否处于一次捏合预览中 */
+static int          s_pinch_preview = 1;     /* 预览字号档 (0..3), commit 后才写入 s_fontsize */
 
 /* === 布局度量 (随旋转方向变化) === */
 static inline bool book_is_portrait(void) {
@@ -1718,6 +1734,7 @@ static const char *menu_str(const char *utf8, const char *gbk) {
 #define M_EMB_HT      menu_str("\xE5\x86\x85\xE5\xB5\x8C\xE9\xBB\x91\xE4\xBD\x93", "\xC4\xDA\xC7\xB6\xBA\xDA\xCC\xE5")  /* 内嵌黑体 */
 #define M_CLEARED     menu_str("\xE5\xB7\xB2\xE6\xB8\x85\xE7\xA9\xBA", "\xD2\xD1\xC7\xE5\xBF\xD5")
 #define M_EXIT_ASK    menu_str("\xE7\xA1\xAE\xE5\xAE\x9A\xE9\x80\x80\xE5\x87\xBA\xE9\x98\x85\xE8\xAF\xBB\xEF\xBC\x9F", "\xC8\xB7\xB6\xA8\xCD\xCB\xB3\xF6\xD4\xC4\xB6\xC1\xA3\xBF")
+#define M_FONT_HINT   menu_str("\xE5\xAD\x97\xE5\x8F\xB7", "\xD7\xD6\xBA\xC5")  /* 字号 */
 static void menu_fb_px(st7305_handle_t *lcd, int x, int y, bool black) {
     if (book_is_portrait() && s_pfb) {
         pfb_px(s_pfb, x, y, black ? 1 : 0);
@@ -2131,6 +2148,53 @@ static void draw_exit_confirm(st7305_handle_t *lcd) {
     menu_draw_text(lcd, X0 + 8, y0 + 6, M_EXIT_ASK, false);
 }
 
+/* 双指捏合字号预览浮层: 捏合期间悬浮显示"字号"与 4 档指示条。
+ * 只画进帧缓冲 (竖屏走 s_pfb 随正文旋转), 不触碰分页/字体, 保证跟手零重排。 */
+static void draw_font_preview(st7305_handle_t *lcd) {
+    if (!s_pinch_active) return;
+    int W = book_is_portrait() ? BOOK_PORTRAIT_W : ST7305_WIDTH;
+    int H = book_is_portrait() ? BOOK_PORTRAIT_H : ST7305_HEIGHT;
+    const int pad = 10;                       /* 内边距 */
+    const int slot = 26;                      /* 每档指示格宽 (含间隔) */
+    const int bar_h = 34;                     /* 指示格高 */
+    font_book_select(s_fontstyle, 24);
+    int label_w = menu_text_width(M_FONT_HINT);
+    int bw = pad * 2 + label_w + 12 + BOOK_FONT_LEVELS * slot - 6;
+    int bh = bar_h + pad * 2;
+    int X0 = (W - bw) / 2, X1 = X0 + bw - 1;
+    int y0 = (H - bh) / 2, y1 = y0 + bh - 1;
+    /* 实心白底 + 2px 黑框 (与退出确认弹窗同一套视觉语言) */
+    for (int y = y0; y <= y1; y++)
+        for (int x = X0; x <= X1; x++)
+            menu_fb_px(lcd, x, y, false);
+    for (int x = X0; x <= X1; x++) {
+        menu_fb_px(lcd, x, y0, true); menu_fb_px(lcd, x, y1, true);
+        menu_fb_px(lcd, x, y0 + 1, true); menu_fb_px(lcd, x, y1 - 1, true);
+    }
+    for (int y = y0; y <= y1; y++) {
+        menu_fb_px(lcd, X0, y, true); menu_fb_px(lcd, X1, y, true);
+        menu_fb_px(lcd, X0 + 1, y, true); menu_fb_px(lcd, X1 - 1, y, true);
+    }
+    int text_y = y0 + (bh - font_book_cell_h()) / 2;
+    menu_draw_text(lcd, X0 + pad, text_y, M_FONT_HINT, false);
+    /* 档位指示格: 当前预览档实心, 其余空心, 直观反映夹取方向与边界 */
+    int gx0 = X0 + pad + label_w + 12;
+    int gy0 = y0 + (bh - bar_h) / 2;
+    for (int i = 0; i < BOOK_FONT_LEVELS; i++) {
+        int gx = gx0 + i * slot;
+        bool filled = (i <= s_pinch_preview);
+        /* 指示格区域 (slot-7 宽): 边框恒黑, 内部随档位实心/空心 */
+        for (int gy = gy0; gy <= gy0 + bar_h - 1; gy++) {
+            for (int gxx = gx; gxx <= gx + slot - 7; gxx++) {
+                bool border = (gy == gy0 || gy == gy0 + bar_h - 1 ||
+                               gxx == gx || gxx == gx + slot - 7);
+                menu_fb_px(lcd, gxx, gy, border || filled);
+            }
+        }
+    }
+    font_book_select(s_fontstyle, book_reader_size_px(s_fontsize));   /* 恢复正文字号 */
+}
+
 /* ============ 渲染入口 ============ */
 
 void book_reader_render(st7305_handle_t *lcd) {
@@ -2148,12 +2212,14 @@ void book_reader_render(st7305_handle_t *lcd) {
         /* 覆盖层画进竖屏画布, 随正文一起旋转 */
         if (s_exit_confirm) draw_exit_confirm(lcd);
         if (s_menu != BM_READ) draw_reader_menu(lcd);
+        if (s_pinch_active) draw_font_preview(lcd);   /* 捏合字号预览 (最上层) */
         /* 旋转全部交驱动底层统一处理 (与书架同套 set_rotation+flush), 消除两套逻辑 */
         st7305_set_rotation(lcd, s_rot, s_pfb);
     } else {
         render_landscape(lcd);
         if (s_exit_confirm) draw_exit_confirm(lcd);
         if (s_menu != BM_READ) draw_reader_menu(lcd);
+        if (s_pinch_active) draw_font_preview(lcd);   /* 捏合字号预览 (最上层) */
         if (s_rot == 1 && !s_rot_buf) {
             s_rot_buf = heap_caps_malloc(15000, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         }
@@ -2220,6 +2286,39 @@ static uint32_t book_page_for_offset(uint32_t off) {
         else hi = mid - 1;
     }
     return (uint32_t)ans;
+}
+
+/* 跳到指定字节偏移所在页 (复用目录跳转同款"等索引扫过该偏移→二分页→等页就绪")。
+ * 抽成函数是为了让"目录选择""双指翻章""重排后恢复位置"共用一条经过验证的路径。 */
+static void book_goto_offset(uint32_t off) {
+    if (s_indexed_bytes < off && !s_index_done) {
+        uint32_t t0 = xTaskGetTickCount();
+        while (!s_index_done && !s_index_error && s_indexed_bytes < off &&
+               (uint32_t)(xTaskGetTickCount() - t0) < pdMS_TO_TICKS(5000))
+            vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    uint32_t p = book_page_for_offset(off);
+    book_wait_indexed_page(p);
+    if (!s_index_error && s_page_count > p) {
+        s_page = p;
+        s_menu = BM_READ;
+    }
+}
+
+/* 当前页所在章节下标 (二分), 无章节返回 (uint32_t)-1。 */
+static uint32_t book_current_chapter_index(void) {
+    if (s_chapter_count == 0) return UINT32_MAX;
+    uint32_t off = 0;
+    if (s_idx_mutex) xSemaphoreTake(s_idx_mutex, portMAX_DELAY);
+    if (s_page < s_page_count) off = s_page_off[s_page];
+    if (s_idx_mutex) xSemaphoreGive(s_idx_mutex);
+    int lo = 0, hi = (int)s_chapter_count - 1, ans = -1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (s_chapters[mid].off <= off) { ans = mid; lo = mid + 1; }
+        else hi = mid - 1;
+    }
+    return (ans >= 0) ? (uint32_t)ans : UINT32_MAX;
 }
 
 static void book_add_bookmark(void) {
@@ -2546,6 +2645,7 @@ void book_reader_close(void) {
     s_loaded_page = 0;
     s_bm_count = 0;
     s_exit_confirm = false;
+    s_pinch_active = false;   /* 复位双指预览, 避免下次打开残留浮层 */
     s_open = false;
     s_path[0] = 0;
     s_src_path[0] = 0;
@@ -2615,6 +2715,92 @@ void book_reader_set_settings(bool knock, int sens, bool night, bool pagenum, in
      * 仅阅读器打开时生效: 否则会把竖屏旋转泄漏到书籍二级菜单/主菜单的触摸坐标,
      * 导致点击位置偏移、返回主菜单后左右反向/反应迟钝 (重启才恢复). */
     if (s_open) input_set_screen_rotation(s_rot);
+}
+
+/* ============ 双指手势 (CST836U 两点触控) ============ */
+
+/* 双指手势只允许作用于"纯净阅读页": 菜单/退出确认/未打开时一律不响应,
+ * 否则会与菜单列表的双指滚动、全局 BACK 语义打架。 */
+static bool book_pinch_guard(void) {
+    return s_open && s_menu == BM_READ && !s_exit_confirm;
+}
+
+/* 取当前阅读位置字节偏移 (加锁), 供重排后尽量回到原处。 */
+static uint32_t book_current_offset(void) {
+    uint32_t off = 0;
+    if (s_idx_mutex) xSemaphoreTake(s_idx_mutex, portMAX_DELAY);
+    if (s_page_off && s_page < s_page_count) off = s_page_off[s_page];
+    if (s_idx_mutex) xSemaphoreGive(s_idx_mutex);
+    return off;
+}
+
+bool book_reader_pinch_font_delta(int steps) {
+    if (!book_pinch_guard() || steps == 0) return false;
+    /* 首次进入一次捏合会话: 以当前生效档初始化预览, 不直接动 s_fontsize。 */
+    if (!s_pinch_active) {
+        s_pinch_active = true;
+        s_pinch_preview = (int)s_fontsize;
+    }
+    int next = book_font_clamp(s_pinch_preview + steps);
+    if (next == s_pinch_preview) return true;   /* 已到档位边界, 仍处于会话中 */
+    s_pinch_preview = next;
+    return true;
+}
+
+bool book_reader_pinch_font_commit(int *out_fontsize, bool *changed) {
+    if (changed) *changed = false;
+    if (out_fontsize) *out_fontsize = (int)s_fontsize;
+    if (!book_pinch_guard()) {
+        s_pinch_active = false;
+        return false;
+    }
+    int target = book_font_clamp(s_pinch_preview);
+    bool really_changed = (s_pinch_active && target != (int)s_fontsize);
+    s_pinch_active = false;
+    if (really_changed) {
+        /* 重排会把页表重建且 s_page 归 0, 先记住字节偏移, 重排后按偏移找回页。 */
+        uint32_t restore_off = book_current_offset();
+        s_fontsize = (uint8_t)target;
+        font_book_select(s_fontstyle, book_reader_size_px(target));
+        book_restart_index();
+        book_goto_offset(restore_off);
+    }
+    if (out_fontsize) *out_fontsize = (int)s_fontsize;
+    if (changed) *changed = really_changed;
+    return true;
+}
+
+bool book_reader_goto_adjacent_chapter(int dir) {
+    if (!book_pinch_guard() || dir == 0 || s_chapter_count == 0) return false;
+    uint32_t cur = book_current_chapter_index();
+    /* 找不到当前章节 (如扉页/前置内容) 时: 后滑去第一章, 其余方向直接拦截。 */
+    int32_t target;
+    if (cur == UINT32_MAX) {
+        if (dir < 0) return false;
+        target = 0;
+    } else {
+        int64_t t = (int64_t)cur + (dir < 0 ? -1 : 1);
+        if (t < 0 || t >= (int64_t)s_chapter_count) return false;   /* 已到首/末章 */
+        target = (int32_t)t;
+    }
+    uint32_t off;
+    if (s_idx_mutex) xSemaphoreTake(s_idx_mutex, portMAX_DELAY);
+    off = s_chapters[target].off;
+    if (s_idx_mutex) xSemaphoreGive(s_idx_mutex);
+    book_goto_offset(off);
+    return true;
+}
+
+/* 打开内部阅读菜单 (供双指点击调用, 与长按 BOOT/屏幕中键同一路径)。
+ * 包一层具名 API, 避免外部页面直接丢魔术数字 8 (BOOK_ACTION_LONG_LEFT)。 */
+bool book_reader_open_menu(void) {
+    if (!book_pinch_guard()) return false;
+    s_menu = BM_MENU;
+    s_menu_sel = 0;
+    s_menu_scroll = 0;
+    s_menu_msg[0] = 0;
+    s_exit_confirm = false;
+    return true;
 }
 
 /* ============ 按键 ============ */
