@@ -4,10 +4,10 @@
 内置步步高(BBK 4980 系列)电子词典模拟器，以及 GB / GBC / NES / MD / SMS / Arduboy / 文曲星 / 暴龙机
 等多款掌机游戏引擎，还有科学计算器、电子书阅读器、密钥管理器、仿真键鼠、收藏系统等多个实用应用。
 
-> **在线刷机**:
-> V1.3.1 之前 https://linit-l.github.io/ESP32-S3-RLCD-BBK/flash/
-> V1.3.1 测试版 https://xiayang0521.github.io/ESP32-S3-RLCD-BBK/flash/
-> （浏览器 WebSerial 直刷 16MB 固件，页面随仓库内置）
+> **在线刷机**:> （浏览器 WebSerial 直刷 16MB 固件，页面随仓库内置）
+** V1.3.1 之前 https://linit-l.github.io/ESP32-S3-RLCD-BBK/flash/ **
+** V1.3.1 测试版 https://xiayang0521.github.io/ESP32-S3-RLCD-BBK/flash/ **
+
 > **固件镜像**: `flash/merged_16mb.bin`（16MB 全量镜像）**/ Release 附件** `LinTOS_v1.3.1_16MB.bin`（内容一致）
 
 ---
