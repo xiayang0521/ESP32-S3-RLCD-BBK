@@ -620,6 +620,61 @@ static void book_shelf_drag(ui_ctx_t *ctx) {
     }
 }
 
+/* ==== 书页双指手势 (CST836U, 由 os_core 常驻回调按当前页路由) ====
+ * 阅读器全屏时: 捏合走"预览→抬手提交→NVS 持久化", 左右滑翻章,
+ * 双指点击开阅读菜单; 上滑/下滑故意不消费, 交还全局兜底
+ * (双指上滑=HOME, 双指点击全局=BACK), 保持全系统手势语义一致。
+ * 书架态: 上下滑整屏翻页, 复用 os_pane 模板 (几何与自绘书架一致: 32px 行高、
+ * 底缘=屏高-4), 到边界也固定消费, 不冒泡 HOME。 */
+static ui_ctx_t *s_reader_ctx = NULL;   /* 阅读器内标记重绘 (开书时捕获) */
+static bool p_book_multi(ui_ctx_t *ctx, const multi_gesture_evt_t *evt) {
+    if (!evt) return false;
+    /* 书架态: 交模板做整屏翻页 (设置模式/收藏栏/最近阅读同样适用) */
+    if (!s_reader_open || !book_reader_is_open())
+        return os_pane_multi_gesture(ctx, &s_bp, evt);
+    bool handled = false;
+
+    /* 连续捏合: type==NONE 且 pinch_steps!=0, 只刷新轻量预览浮层 */
+    if (evt->type == MULTI_GESTURE_NONE && evt->pinch_steps != 0) {
+        if (book_reader_pinch_font_delta(evt->pinch_steps) && s_reader_ctx)
+            s_reader_ctx->needs_redraw = true;
+        return true;   /* 连续事件返回值无意义, 统一按已处理 */
+    }
+
+    switch (evt->type) {
+    case MULTI_GESTURE_PINCH_END: {
+        /* 抬手一次性提交重排; 只有档位真的变化才写 NVS, 减少闪存磨损 */
+        int fs = s_bs_fontsize;
+        bool changed = false;
+        if (book_reader_pinch_font_commit(&fs, &changed)) {
+            if (changed) {
+                s_bs_fontsize = fs;
+                bs_save();
+            }
+            if (s_reader_ctx) s_reader_ctx->needs_redraw = true;
+        }
+        handled = true;
+        break;
+    }
+    case MULTI_GESTURE_SWIPE_LEFT:
+        handled = book_reader_goto_adjacent_chapter(-1);   /* 上一章 */
+        break;
+    case MULTI_GESTURE_SWIPE_RIGHT:
+        handled = book_reader_goto_adjacent_chapter(1);    /* 下一章 */
+        break;
+    case MULTI_GESTURE_TAP:
+        handled = book_reader_open_menu();                 /* 双指点击=阅读菜单 */
+        break;
+    case MULTI_GESTURE_SWIPE_UP:
+    case MULTI_GESTURE_SWIPE_DOWN:
+    default:
+        handled = false;   /* 上交全局: 上滑=HOME; 其余方向阅读器不占用 */
+        break;
+    }
+    if (handled && s_reader_ctx) s_reader_ctx->needs_redraw = true;
+    return handled;
+}
+
 /* 右栏确认: 打开书籍 */
 static void on_book_select(ui_ctx_t *ctx, os_pane_t *p,
                            const char *path, const char *name) {
@@ -627,11 +682,23 @@ static void on_book_select(ui_ctx_t *ctx, os_pane_t *p,
     bs_apply();
     if (book_reader_open(path)) {
         s_reader_open = true;
+        s_reader_ctx = ctx;   /* 双指由模块 ops 统一路由, 无需再抢占回调槽 */
         ctx->fullscreen = true;
         ESP_LOGI(TAG, "打开: %s", path);
     } else {
         os_dialog_toast(ctx, "\xe6\x96\x87\xe4\xbb\xb6\xe6\x8d\x9f\xe5\x9d\x8f");   /* 文件损坏 */
     }
+}
+
+/* 统一收尾阅读器: 关闭组件 + 退出全屏。
+ * 三条离开路径 (BACK 动作 / 页面 exit / 内部菜单"返回书库") 共用。
+ * 双指手势走模块 ops 按 s_reader_open 自动分流, 无需注销回调。 */
+static void reader_teardown(ui_ctx_t *ctx) {
+    if (!s_reader_open) return;
+    book_reader_close();
+    s_reader_open = false;
+    s_reader_ctx = NULL;
+    if (ctx) ctx->fullscreen = false;
 }
 
 /* 最近阅读入口: 从 NVS 读最近打开的书 (TF 卡损坏/换卡后仍可回到最近一本) */
@@ -675,11 +742,7 @@ static void p_book_enter(ui_ctx_t *ctx) {
 
 static void p_book_exit(ui_ctx_t *ctx) {
     /* 从阅读器直接 HOME/退出离开: 先收尾阅读器 (释放内存+复位), 再复位触摸旋转 */
-    if (s_reader_open) {
-        book_reader_close();
-        s_reader_open = false;
-        ctx->fullscreen = false;
-    }
+    if (s_reader_open) reader_teardown(ctx);
     book_rotation_off(ctx);   /* 卸载书架旋转 (含 map_touch), 阅读器自管全局旋转 */
     input_set_screen_rotation(0);
 }
@@ -695,9 +758,9 @@ static void p_book_render(ui_ctx_t *ctx) {
         return;
     }
     if (s_reader_open) {
-        /* 阅读器已通过内部菜单关闭 (如"返回书库") → 收尾并刷新最近阅读 */
-        s_reader_open = false;
-        ctx->fullscreen = false;
+        /* 阅读器已通过内部菜单关闭 (如"返回书库"): close 已自行执行 (幂等),
+         * 但双指回调仍挂着 → 必须走统一收尾注销, 否则回调会泄漏到书架 */
+        reader_teardown(ctx);
         bs_load();   /* 同步阅读器内旋转方向 (book_rotate_next 已写 NVS) */
         book_recent_load();
         s_bp.built_folder = -1;
@@ -712,9 +775,7 @@ static void p_book_render(ui_ctx_t *ctx) {
 static void p_book_action(ui_ctx_t *ctx, os_action_t a) {
     if (s_reader_open) {
         if (a == OS_ACTION_BACK) {
-            book_reader_close();
-            s_reader_open = false;
-            ctx->fullscreen = false;
+            reader_teardown(ctx);
             /* 刚读完的书 → 刷新「最近阅读」右栏 + 同步阅读器内旋转方向 */
             bs_load();
             book_recent_load();
@@ -755,6 +816,7 @@ static const os_module_t s_mod_book = {
     .action     = p_book_action,
     .touch      = p_book_touch,
     .poll       = p_book_poll,
+    .multi_gesture = p_book_multi,
     .fullscreen = false,
 };
 
