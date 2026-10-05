@@ -4,10 +4,7 @@
 #   - Push of tag matching v* (e.g. v1.3.2)
 #   - Workflow dispatch (manual): inputs = tag_name
 #
-# Environment:
-#   - Ubuntu 24.04
-#   - esp-idf v5.5.5, esp32-s3 target
-#   - merges bootloader + partition + app + fonts + 8.BIN/E.BIN/oui_db into 16MB flash image
+# Uses espressif/setup-idf action — handles submodules, toolchain, Python venv automatically.
 
 name: Build & Release
 
@@ -33,9 +30,7 @@ jobs:
   build:
     name: Build LinTOS v${{ github.ref_name }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
-    env:
-      TAG_NAME: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag_name }}
+    timeout-minutes: 45
 
     steps:
       - name: Resolve tag
@@ -55,33 +50,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0     # 全量拉取, merge_flash.sh 需要完整 git log
           submodules: recursive
 
-      - name: Install ESP-IDF pre-requisites
-        run: |
-          # Minimal apt deps; esp-idf install.sh handles the rest
-          sudo apt-get update
-          sudo apt-get install -y git cmake ninja-build python3 python3-venv python3-pip \
-                                  gcc g++ make wget curl xz-utils file p7zip-full bash bc
-
-      - name: Install ESP-IDF v5.5.5 toolchain
-        shell: bash
-        run: |
-          set -euo pipefail
-          git clone --depth 1 -b v5.5.5 https://github.com/espressif/esp-idf.git ~/esp/esp-idf
-          cd ~/esp/esp-idf
-          # Linux pre-reqs handled by install.sh itself (ubuntu 24.04 compatible)
-          ./install.sh esp32s3 2>&1 | tail -20
-          echo "IDF_PATH=$HOME/esp/esp-idf" >> "$GITHUB_ENV"
-          echo "$HOME/.espressif/python_env/idf5.5_py3.13_env/bin" >> "$GITHUB_PATH"
-          ls ~/.espressif/tools/ 2>/dev/null || true
+      - name: Install ESP-IDF v5.5.x via official action
+        uses: espressif/setup-idf@v5
+        with:
+          esp-idf-version: "v5.5.5"
+          target: "esp32s3"
+          # 预下载子模块并初始化 —— esp-mqtt / esp_websocket_client 等必需
+          recurse-submodules: true
+          install-python-env: true
 
       - name: Build firmware
         shell: bash
         run: |
           set -euo pipefail
-          source "$HOME/esp/esp-idf/export.sh"
+          source "$IDF_PATH/export.sh"
           cd "$GITHUB_WORKSPACE"
           idf.py set-target esp32s3
           idf.py build
@@ -92,7 +77,6 @@ jobs:
           set -euo pipefail
           cd "$GITHUB_WORKSPACE"
           # merge_flash.sh 用 macOS stat -f%z, Linux stat -c %s 不同
-          # 给它一个 stat 包装, 自动转发到 /usr/bin/stat -c %s
           mkdir -p /tmp/statwrap
           cat > /tmp/statwrap/stat <<'EOF'
           #!/usr/bin/env bash
@@ -167,9 +151,9 @@ jobs:
         run: |
           TAG=$(cat /tmp/tag_name.txt)
           git tag -a "$TAG" -m "LinTOS ${TAG}"
-          git push origin "$TAG" --force 2>&1 || true   # 如果 tag 已存在 force push 覆盖
+          git push origin "$TAG" --force 2>&1 || true
 
-      - name: Upload merged image as release asset
+      - name: Create GitHub Release & upload assets
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
