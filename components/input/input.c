@@ -225,25 +225,25 @@ void input_init(void) {
         s_btns[0] = (btn_ctx_t){
             .gpio = BTN_GPIO_RIGHT, .state = ST_IDLE, .press_start = 0,
             .rel_short = false, .rel_short_ms = 0, .rel_action = MENU_ACTION_NONE,
-            .stages = {{ {0, MENU_ACTION_LEFT},
+            .stages = { {0, MENU_ACTION_LEFT},
                          {800, MENU_ACTION_BACK},
-                         {3000, MENU_ACTION_HOME} }},
+                         {3000, MENU_ACTION_HOME} },
             .stage_count = 3, .fired_mask = 0, .name = "BOOT",
         };
         s_btns[1] = (btn_ctx_t){
             .gpio = BTN_GPIO_LEFT, .state = ST_IDLE, .press_start = 0,
             .rel_short = false, .rel_short_ms = 0, .rel_action = MENU_ACTION_NONE,
-            .stages = {{ {0, MENU_ACTION_RIGHT},
+            .stages = { {0, MENU_ACTION_RIGHT},
                          {800, MENU_ACTION_CONFIRM},
-                         {2000, MENU_ACTION_BT_SEARCH} }},
+                         {2000, MENU_ACTION_BT_SEARCH} },
             .stage_count = 3, .fired_mask = 0, .name = "KEY",
         };
         s_btns[2] = (btn_ctx_t){
             .gpio = BTN_GPIO_PWR, .state = ST_IDLE, .press_start = 0,
             .rel_short = false, .rel_short_ms = 0, .rel_action = MENU_ACTION_NONE,
-            .stages = {{ {0, MENU_ACTION_UP},
+            .stages = { {0, MENU_ACTION_UP},
                          {1000, MENU_ACTION_DOWN},
-                         {4000, MENU_ACTION_POWER_LOCK} }},
+                         {4000, MENU_ACTION_POWER_LOCK} },
             .stage_count = 3, .fired_mask = 0, .name = "PWR",
         };
     } else {
@@ -254,16 +254,16 @@ void input_init(void) {
         s_btns[0] = (btn_ctx_t){
             .gpio = BTN_GPIO_RIGHT, .state = ST_IDLE, .press_start = 0,
             .rel_short = false, .rel_short_ms = 0, .rel_action = MENU_ACTION_NONE,
-            .stages = {{ {0, MENU_ACTION_RIGHT},
+            .stages = { {0, MENU_ACTION_RIGHT},
                          {500, MENU_ACTION_BACK},
-                         {3000, MENU_ACTION_HOME} }},
+                         {3000, MENU_ACTION_HOME} },
             .stage_count = 3, .fired_mask = 0, .name = "BOOT",
         };
         s_btns[1] = (btn_ctx_t){
             .gpio = BTN_GPIO_LEFT, .state = ST_IDLE, .press_start = 0,
             .rel_short = false, .rel_short_ms = 0, .rel_action = MENU_ACTION_NONE,
-            .stages = {{ {0, MENU_ACTION_CONFIRM},
-                         {2000, MENU_ACTION_BT_SEARCH} }},
+            .stages = { {0, MENU_ACTION_CONFIRM},
+                         {2000, MENU_ACTION_BT_SEARCH} },
             .stage_count = 2, .fired_mask = 0, .name = "KEY",
         };
         /* PWR (无触摸机型): 保持"释放判定短按=锁屏, 长按2s=关机"的旧语义 */
@@ -271,7 +271,7 @@ void input_init(void) {
             .gpio = BTN_GPIO_PWR, .state = ST_IDLE, .press_start = 0,
             .rel_short = true, .rel_short_ms = PWR_SHORT_MS,
             .rel_action = MENU_ACTION_POWER_LOCK,
-            .stages = {{ {POWER_HOLD_MS, MENU_ACTION_NONE} }},
+            .stages = { {POWER_HOLD_MS, MENU_ACTION_NONE} },
             .stage_count = 1, .fired_mask = 0, .name = "PWR",
         };
     }
