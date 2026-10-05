@@ -54,13 +54,13 @@ jobs:
           submodules: recursive
 
       - name: Install ESP-IDF v5.5.x via official action
-        uses: espressif/setup-idf@v5
+        uses: espressif/install-esp-idf-action@v1
         with:
-          esp-idf-version: "v5.5.5"
-          target: "esp32s3"
+          esp_idf_version: "v5.5.5"
+          target_chip: esp32s3
           # 预下载子模块并初始化 —— esp-mqtt / esp_websocket_client 等必需
-          recurse-submodules: true
-          install-python-env: true
+          recursive: true
+          python_env: "idf5.5_py3.13_env"
 
       - name: Build firmware
         shell: bash
