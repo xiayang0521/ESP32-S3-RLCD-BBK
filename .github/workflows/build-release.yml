@@ -53,14 +53,18 @@ jobs:
           fetch-depth: 0     # 全量拉取, merge_flash.sh 需要完整 git log
           submodules: recursive
 
-      - name: Install ESP-IDF v5.5.x via official action
-        uses: espressif/install-esp-idf-action@v1
-        with:
-          esp_idf_version: "v5.5.5"
-          target_chip: esp32s3
-          # 预下载子模块并初始化 —— esp-mqtt / esp_websocket_client 等必需
-          recursive: true
-          python_env: "idf5.5_py3.13_env"
+      - name: Install ESP-IDF v5.5.5 (full clone + submodules)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 完整 clone esp-idf v5.5.5 (不用 --depth 1, 否则 submodule refs 不全)
+          git clone --branch v5.5.5 --single-branch https://github.com/espressif/esp-idf.git ~/esp/esp-idf
+          cd ~/esp/esp-idf
+          # 拉取所有 submodules (esp-mqtt, esp_websocket_client, esp-docker 等必需)
+          git submodule update --init --recursive --jobs 4
+          # install.sh 自动下载工具链 + Python venv
+          ./install.sh esp32s3 2>&1 | tail -15
+          echo "IDF_PATH=$HOME/esp/esp-idf" >> "$GITHUB_ENV"
 
       - name: Build firmware
         shell: bash
