@@ -72,7 +72,7 @@ jobs:
           git clone --depth 1 -b v5.5.5 https://github.com/espressif/esp-idf.git ~/esp/esp-idf
           cd ~/esp/esp-idf
           # Linux pre-reqs handled by install.sh itself (ubuntu 24.04 compatible)
-          ./install.sh esp32s3 --skip-esp32ulp 2>&1 | tail -20
+          ./install.sh esp32s3 2>&1 | tail -20
           echo "IDF_PATH=$HOME/esp/esp-idf" >> "$GITHUB_ENV"
           echo "$HOME/.espressif/python_env/idf5.5_py3.13_env/bin" >> "$GITHUB_PATH"
           ls ~/.espressif/tools/ 2>/dev/null || true
