@@ -78,16 +78,34 @@ static uint32_t now_ms(void) {
     return xTaskGetTickCount() * portTICK_PERIOD_MS;
 }
 
-typedef enum { ST_IDLE, ST_DEBOUNCE, ST_PRESSED, ST_LONG_FIRED } btn_state_t;
+typedef enum { ST_IDLE, ST_DEBOUNCE, ST_PRESSED } btn_state_t;
+
+/* === V1.8.x: 多阶段长按按键结构 ===
+ * 旧单阶段 (short + long + rel_short) 已升级为阶段数组: 一颗物理键可配置多个
+ * "按住期间达到阈值 → 发射一次边沿动作" 的阶段. 阶段按 ms 升序排列,
+ * ms==0 表示"按下经 debounce 立即发射" (原有边沿短按的等价物).
+ *
+ * rel_short 保留给特殊键 (PWR 锁屏): 当没有任何 ms==0 的阶段时, 释放瞬间
+ * 根据按住时长 < rel_short_ms 判定是否补发 rel_action.
+ *
+ * fired_mask: bit i=1 表示 stages[i] 已发射过 (一次性边沿, 不会重复).
+ * 这样 BOOT 就能同时承担 "短按LEFT + 长按0.8s BACK + 长按3s HOME" 三段职责. */
+#define BTN_MAX_STAGES 5
 typedef struct {
     gpio_num_t gpio;
     btn_state_t state;
     uint32_t press_start;
-    uint32_t long_ms;          /* 本键长按阈值 (ms), 0=用全局 LONG_PRESS_MS */
-    menu_action_t short_action, long_action;
-    bool rel_short;            /* V1.5.x: 短按动作改为"释放时判定" — 按住时长<阈值(0.5s)
-                                * 松手才投 short_action; 长按时不提前投, 避免与长按动作打架.
-                                * 目前仅开关键(PWR)用: 短按(<0.5s)松手=锁屏; 长按2s=关机弹窗. */
+    /* 释放判定 (可选): 当没有 ms==0 的阶段时, 释放瞬间按按住时长 < rel_short_ms 补发 */
+    bool rel_short;
+    uint32_t rel_short_ms;
+    menu_action_t rel_action;
+    /* 阶段数组 (必须按 ms 升序排列, 最多 BTN_MAX_STAGES 个) */
+    struct {
+        uint32_t ms;         /* 相对按下时刻的阈值 (ms); 0 = 经 debounce 立即发射 */
+        menu_action_t act;   /* 达到阈值时发射的动作 */
+    } stages[BTN_MAX_STAGES];
+    uint8_t stage_count;
+    uint8_t fired_mask;
     const char *name;
 } btn_ctx_t;
 
@@ -183,23 +201,80 @@ void input_init(void) {
     s_has_touch = touch_panel_is_present();
 
     if (s_has_touch) {
-        /* 有触摸机型: 导航/确认靠触摸手势, 两颗物理键只是触摸的等价物.
-         *   BOOT: 短按=返回上级, 长按3s=回主菜单 (用户需求: 长按返回键3秒强制回桌面)
-         *   KEY : 短按=确认,     长按=收藏当前项 */
-        s_btns[0] = (btn_ctx_t){ BTN_GPIO_RIGHT, ST_IDLE, 0, 3000, MENU_ACTION_BACK, MENU_ACTION_HOME, false, "BOOT" };
-        s_btns[1] = (btn_ctx_t){ BTN_GPIO_LEFT,  ST_IDLE, 0, 2000, MENU_ACTION_CONFIRM, MENU_ACTION_BT_SEARCH, false, "KEY" };
+        /* === V1.8.x: 有触摸机型完整物理键导航 ===
+         * 触屏是主通道, 三颗物理键承担"兜底完整菜单导航":
+         *   BOOT (GPIO0): LEFT 方向 + 返回 + HOME
+         *     短按(debounce后) = LEFT  (主菜单左移, 所有横向选择的左向)
+         *     长按 0.8s        = BACK  (返回上级, 释放后不再补发 LEFT)
+         *     长按 3.0s        = HOME  (强制回主菜单, 保留旧需求)
+         *   KEY  (GPIO18): RIGHT 方向 + 确认 + 蓝牙搜索
+         *     短按(debounce后) = RIGHT (主菜单右移, 所有横向选择的右向)
+         *     长按 0.8s        = CONFIRM (确认/进入, 长按确认)
+         *     长按 2.0s        = BT_SEARCH (蓝牙搜索, 保留旧需求)
+         *   PWR  (GPIO1): UP + DOWN 方向 + 锁屏
+         *     短按(debounce后) = UP    (所有纵向选择的上向)
+         *     长按 1.0s        = DOWN  (所有纵向选择的下向)
+         *     长按 4.0s        = POWER_LOCK (锁屏, 原短按锁屏挪到此处)
+         *   长按 2.0s 关机弹窗: 由 input_power_should_sleep 独立轮询处理 (不走 tick).
+         *
+         * ⚠️ 与 V1.7 及旧版物理键语义差异 — 用户须知:
+         *   旧版 BOOT 短按=BACK、KEY 短按=CONFIRM; 新版改为方向键.
+         *   核心动作 (BACK/CONFIRM) 挪到"长按 0.8s"段. 触屏仍是主操作通道,
+         *   物理键定位为"无触屏/触屏不便时的完整兜底导航" — 三颗键能独立完成
+         *   从主菜单浏览到设置到应用到退出的全部操作. */
+        s_btns[0] = (btn_ctx_t){
+            .gpio = BTN_GPIO_RIGHT, .state = ST_IDLE, .press_start = 0,
+            .rel_short = false, .rel_short_ms = 0, .rel_action = MENU_ACTION_NONE,
+            .stages = {{ {0, MENU_ACTION_LEFT},
+                         {800, MENU_ACTION_BACK},
+                         {3000, MENU_ACTION_HOME} }},
+            .stage_count = 3, .fired_mask = 0, .name = "BOOT",
+        };
+        s_btns[1] = (btn_ctx_t){
+            .gpio = BTN_GPIO_LEFT, .state = ST_IDLE, .press_start = 0,
+            .rel_short = false, .rel_short_ms = 0, .rel_action = MENU_ACTION_NONE,
+            .stages = {{ {0, MENU_ACTION_RIGHT},
+                         {800, MENU_ACTION_CONFIRM},
+                         {2000, MENU_ACTION_BT_SEARCH} }},
+            .stage_count = 3, .fired_mask = 0, .name = "KEY",
+        };
+        s_btns[2] = (btn_ctx_t){
+            .gpio = BTN_GPIO_PWR, .state = ST_IDLE, .press_start = 0,
+            .rel_short = false, .rel_short_ms = 0, .rel_action = MENU_ACTION_NONE,
+            .stages = {{ {0, MENU_ACTION_UP},
+                         {1000, MENU_ACTION_DOWN},
+                         {4000, MENU_ACTION_POWER_LOCK} }},
+            .stage_count = 3, .fired_mask = 0, .name = "PWR",
+        };
     } else {
-        /* 无触摸机型: 只剩两颗物理键, 要让两键也能闭环操作到蓝牙映射界面.
-         *   BOOT: 短按=下一步(右移/选中右移), 长按=返回上级
-         *   KEY : 短按=确认(进入),             长按2s=蓝牙搜索 */
-        s_btns[0] = (btn_ctx_t){ BTN_GPIO_RIGHT, ST_IDLE, 0, 0, MENU_ACTION_RIGHT, MENU_ACTION_BACK, false, "BOOT" };
-        s_btns[1] = (btn_ctx_t){ BTN_GPIO_LEFT,  ST_IDLE, 0, 2000, MENU_ACTION_CONFIRM, MENU_ACTION_BT_SEARCH, false, "KEY" };
+        /* 无触摸机型: 两颗物理键闭环. 语义与 V1.7 保持一致, 改为新阶段格式:
+         *   BOOT: 短按=RIGHT(下一步/右移), 长按=BACK(返回上级), 长按3s=HOME
+         *   KEY : 短按=CONFIRM(进入),      长按2s=BT_SEARCH(蓝牙搜索)
+         *   PWR : 短按(释放判定)=POWER_LOCK(锁屏), 长按2s=关机(独立轮询) */
+        s_btns[0] = (btn_ctx_t){
+            .gpio = BTN_GPIO_RIGHT, .state = ST_IDLE, .press_start = 0,
+            .rel_short = false, .rel_short_ms = 0, .rel_action = MENU_ACTION_NONE,
+            .stages = {{ {0, MENU_ACTION_RIGHT},
+                         {500, MENU_ACTION_BACK},
+                         {3000, MENU_ACTION_HOME} }},
+            .stage_count = 3, .fired_mask = 0, .name = "BOOT",
+        };
+        s_btns[1] = (btn_ctx_t){
+            .gpio = BTN_GPIO_LEFT, .state = ST_IDLE, .press_start = 0,
+            .rel_short = false, .rel_short_ms = 0, .rel_action = MENU_ACTION_NONE,
+            .stages = {{ {0, MENU_ACTION_CONFIRM},
+                         {2000, MENU_ACTION_BT_SEARCH} }},
+            .stage_count = 2, .fired_mask = 0, .name = "KEY",
+        };
+        /* PWR (无触摸机型): 保持"释放判定短按=锁屏, 长按2s=关机"的旧语义 */
+        s_btns[2] = (btn_ctx_t){
+            .gpio = BTN_GPIO_PWR, .state = ST_IDLE, .press_start = 0,
+            .rel_short = true, .rel_short_ms = PWR_SHORT_MS,
+            .rel_action = MENU_ACTION_POWER_LOCK,
+            .stages = {{ {POWER_HOLD_MS, MENU_ACTION_NONE} }},
+            .stage_count = 1, .fired_mask = 0, .name = "PWR",
+        };
     }
-    /* 开关键 (V1.5.x): rel_short=true — 短按动作改"释放判定":
-     *   按住 <0.5s 松手 → POWER_LOCK(锁屏进壁纸); 持续按住 ≥0.5s 不投(避免长按关机途中误锁屏),
-     *   到 2s 由 input_power_should_sleep 独立轮询弹"是否关机"确认框.
-     *   long_action 保持 NONE (长按关机不由本键 tick 投递). */
-    s_btns[2] = (btn_ctx_t){ BTN_GPIO_PWR, ST_IDLE, 0, POWER_HOLD_MS, MENU_ACTION_POWER_LOCK, MENU_ACTION_NONE, true, "PWR" };
 
     /* V1.0.68: 软关机键 GPIO1 同时配置 deep sleep 唤醒 (长按2s软关机后按下唤醒)
      * V1.5.x: 任意物理键唤醒 — 三颗键都加入 ext1 掩码 (按键按下=低电平, 已统一上拉) */
@@ -209,22 +284,47 @@ void input_init(void) {
         ESP_EXT1_WAKEUP_ANY_LOW);
 }
 
+/* V1.8.x: 多阶段长按 tick.
+ *
+ * === 核心设计: 方向键智能延迟释放 ===
+ * 当一颗按键同时有 ms==0 的方向阶段 和 ms>0 的核心阶段时 (例如 BOOT: LEFT + BACK + HOME),
+ * 用户按下后:
+ *   按住 < T/2 松手 → 短按方向键 (释放时补发 ms==0 的动作)
+ *   按住 ≥ T 松手  → 长按核心动作 (发射 ms>T 的核心阶段, 跳过方向键)
+ *   按住 ≥ T 不松  → 持续触发后续核心阶段 (BACK→HOME 逐级发射)
+ * 其中 T = 该按键第一个 ms>0 阶段的 ms 值 (例如 BOOT 的 800ms).
+ * 这样避免"按 BACK 返回时主菜单先左移一格"的方向/核心双发射冲突.
+ *
+ * 对于"只有 ms==0 阶段、没有 ms>0 阶段"的纯方向键场景 (如手柄),
+ * 立即发射不做延迟 (保持边沿语义).
+ *
+ * fired_mask: bit i=1 表示 stages[i] 已发射 (一次性边沿).
+ * rel_short: 特殊键 (PWR 锁屏) 的额外释放判定, 与方向键延迟独立. */
 static menu_action_t tick(btn_ctx_t *b) {
     bool pressed = (gpio_get_level(b->gpio) == 0);
     uint32_t now = now_ms();
     switch (b->state) {
         case ST_IDLE:
+            b->fired_mask = 0;
             if (pressed) { b->state = ST_DEBOUNCE; b->press_start = now; }
             break;
         case ST_DEBOUNCE:
-            /* V1.5.x: 按下防抖 (原 DEBOUNCE 只防释放抖动; 按下即触发改为防住
-             * 按下沿抖动误触发). rel_short 键(开关键)防抖通过后只进入 PRESSED,
-             * 短按动作延后到"释放时"按按住时长判定 (见 ST_PRESSED 释放分支);
-             * 普通键防抖通过后立即投递短按动作, 不等松手. */
             if (pressed) {
                 if (now - b->press_start >= DEBOUNCE_MS) {
                     b->state = ST_PRESSED;
-                    if (!b->rel_short) return b->short_action;
+                    /* 纯边沿短按键 (没有任何 ms>0 阶段) → 立即发射 ms==0 动作;
+                     * 否则延后到释放时判定 (避免方向键/核心动作双发射) */
+                    bool has_followup = false;
+                    for (int i = 0; i < b->stage_count; i++)
+                        if (b->stages[i].ms > 0) { has_followup = true; break; }
+                    if (!has_followup) {
+                        for (int i = 0; i < b->stage_count; i++) {
+                            if (b->stages[i].ms == 0 && !(b->fired_mask & (1u << i))) {
+                                b->fired_mask |= (1u << i);
+                                return b->stages[i].act;
+                            }
+                        }
+                    }
                 }
             } else {
                 b->state = ST_IDLE;   /* 抖动, 取消本次按下 */
@@ -232,29 +332,51 @@ static menu_action_t tick(btn_ctx_t *b) {
             break;
         case ST_PRESSED:
             if (pressed) {
-                uint32_t thr = (b->long_ms > 0) ? b->long_ms : LONG_PRESS_MS;
-                if (now - b->press_start > thr) {
-                    /* V1.0.40: 长按发射后进入 ST_LONG_FIRED, 等按键释放才回 IDLE.
-                     * V1.5.x 提示: 开关键(rel_short)长按 2s 在此进入 LONG_FIRED,
-                     * 投递 long_action=NONE (长按关机由 input_power_should_sleep
-                     * 独立轮询弹确认框), 此后释放不再误触发锁屏. */
-                    b->state = ST_LONG_FIRED;
-                    return b->long_action;
+                uint32_t held = now - b->press_start;
+                /* 检查所有未发射的非零阶段: 达到阈值 → 发射一次核心动作 */
+                for (int i = 0; i < b->stage_count; i++) {
+                    if (!(b->fired_mask & (1u << i)) && b->stages[i].ms > 0 &&
+                        held >= b->stages[i].ms) {
+                        b->fired_mask |= (1u << i);
+                        return b->stages[i].act;
+                    }
                 }
             } else {
-                /* V1.5.x: rel_short 键(开关键)短按判定 — 按住 <0.5s 松手 → 投短按(锁屏);
-                 * 按住 ≥0.5s 松手 → 不投 (此时长按关机意图, 避免松手误锁屏).
-                 * 普通键短按已在按下瞬间投递, 释放不再重复触发. */
+                /* 释放: 方向键延迟判定 */
+                uint32_t held = now - b->press_start;
+                uint32_t first_thr = 0xFFFFFFFF;
+                bool has_edge = false;
+                for (int i = 0; i < b->stage_count; i++) {
+                    if (b->stages[i].ms == 0) has_edge = true;
+                    else if (b->stages[i].ms < first_thr) first_thr = b->stages[i].ms;
+                }
                 b->state = ST_IDLE;
-                if (b->rel_short && (now - b->press_start) < PWR_SHORT_MS)
-                    return b->short_action;
-            }
-            break;
-        case ST_LONG_FIRED:
-            /* 长按已发射, 等待按键释放, 期间不产生任何动作.
-             * V1.0.69: 开关键去掉 0.5s"返回菜单"中间层, 此处不再投递 POWER_RELEASE */
-            if (!pressed) {
-                b->state = ST_IDLE;
+                /* 方向键短按释放补发: 按住时长 < T/2 才算短按方向 (T=第一核心阈值),
+                 * 超过 T/2 说明用户意图是长按核心动作, 跳过方向键.
+                 * 没有核心阶段的纯方向键: 立即释放时补发 (保持边沿语义). */
+                if (has_edge && first_thr == 0xFFFFFFFF) {
+                    /* 纯方向键, 没有核心阶段 → 释放时补发 */
+                    for (int i = 0; i < b->stage_count; i++) {
+                        if (b->stages[i].ms == 0 && !(b->fired_mask & (1u << i))) {
+                            b->fired_mask |= (1u << i);
+                            return b->stages[i].act;
+                        }
+                    }
+                } else if (has_edge && held < first_thr / 2) {
+                    /* 短按 (< T/2) → 补发方向键 */
+                    for (int i = 0; i < b->stage_count; i++) {
+                        if (b->stages[i].ms == 0 && !(b->fired_mask & (1u << i))) {
+                            b->fired_mask |= (1u << i);
+                            return b->stages[i].act;
+                        }
+                    }
+                }
+                /* rel_short 键 (PWR 锁屏): 额外的释放判定 — 无 ms==0 阶段时 */
+                bool any_edge = false;
+                for (int i = 0; i < b->stage_count; i++)
+                    if (b->stages[i].ms == 0) { any_edge = true; break; }
+                if (b->rel_short && !any_edge && held < b->rel_short_ms)
+                    return b->rel_action;
             }
             break;
     }
