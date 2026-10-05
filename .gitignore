@@ -1,5 +1,7 @@
 # ===== ESP-IDF 构建产物 (可重新生成) =====
-build*
+# build*/: ESP-IDF 编译产物目录; 不匹配根目录外的同名文件 (如 .github/workflows/build-release.yml)
+/build/
+build_*/
 managed_components/
 sdkconfig
 sdkconfig.old
