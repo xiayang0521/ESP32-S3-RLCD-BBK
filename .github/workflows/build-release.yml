@@ -80,12 +80,20 @@ jobs:
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE"
-          # merge_flash.sh 用 macOS stat -f%z, Linux stat -c %s 不同
+          # merge_flash.sh 用 macOS stat -f%z 取文件大小, Linux stat 用 -c %s
+          # 用 Python 做 stat 包装 — 忽略传入的 -f%z, 用 os.path.getsize 返回纯数字
           mkdir -p /tmp/statwrap
-          cat > /tmp/statwrap/stat <<'EOF'
-          #!/usr/bin/env bash
-          exec /usr/bin/stat -c %s "$@"
-          EOF
+          cat > /tmp/statwrap/stat <<'STATPY'
+          #!/usr/bin/env python3
+          import os, sys
+          # 从参数中找文件路径 (跳过 macOS 的 -f%z 等格式选项)
+          args = sys.argv[1:]
+          files = [a for a in args if not a.startswith('-')]
+          if not files:
+              sys.exit(1)
+          for f in files:
+              print(os.path.getsize(f))
+          STATPY
           chmod +x /tmp/statwrap/stat
           export PATH="/tmp/statwrap:$PATH"
           bash merge_flash.sh
