@@ -5,8 +5,8 @@
 #   - Workflow dispatch (manual): inputs = tag_name
 #
 # Environment:
-#   - Ubuntu 24.04 (esp-idf v5.5.x toolchain needs glibc 2.34+, 22.04 only has 2.31)
-#   - esp32-s3 target, release build
+#   - Ubuntu 24.04
+#   - esp-idf v5.5.5, esp32-s3 target
 #   - merges bootloader + partition + app + fonts + 8.BIN/E.BIN/oui_db into 16MB flash image
 
 name: Build & Release
@@ -18,18 +18,24 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Tag name (v*) — will be created if missing, else builds existing one"
+        description: "Tag name (v*) — tag will be created if missing"
         required: false
         default: ""
 
 permissions:
   contents: write
 
+concurrency:
+  group: release-build
+  cancel-in-progress: true
+
 jobs:
   build:
-    name: Build ESP-IDF firmware
+    name: Build LinTOS v${{ github.ref_name }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 40
+    env:
+      TAG_NAME: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag_name }}
 
     steps:
       - name: Resolve tag
@@ -37,8 +43,11 @@ jobs:
         run: |
           if [ -n "${{ github.event.inputs.tag_name }}" ]; then
             TAG="${{ github.event.inputs.tag_name }}"
+          elif [ "${{ github.ref_type }}" = "tag" ]; then
+            TAG="${{ github.ref_name }}"
           else
-            TAG="${GITHUB_REF_NAME}"
+            echo "ERROR: not on a tag push and no tag_name input"
+            exit 1
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "$TAG" > /tmp/tag_name.txt
@@ -47,24 +56,32 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          submodules: recursive
 
-      - name: Install ESP-IDF v5.5 toolchain
+      - name: Install ESP-IDF pre-requisites
         run: |
-          # ESP-IDF v5.5.x: esp-14.2.0 + GCC 14.2.0_20260121 + Python 3.13
+          # Minimal apt deps; esp-idf install.sh handles the rest
           sudo apt-get update
-          sudo apt-get install -y gcc git wget make python3 python3-venv cmake ninja-build ccache \
-                                  libusb-1.0-0 libglib2.0-0 libsmbus-dev libssl-dev p7zip-full xz-utils file
-          # ESP-IDF 直接克隆 v5.5 稳定分支
-          git clone --recursive --depth 1 -b v5.5.5 https://github.com/espressif/esp-idf.git ~/esp/esp-idf-v55
-          cd ~/esp/esp-idf-v55
-          ./install.sh esp32s3
-          echo "IDF_PATH=$HOME/esp/esp-idf-v55" >> "$GITHUB_ENV"
+          sudo apt-get install -y git cmake ninja-build python3 python3-venv python3-pip \
+                                  gcc g++ make wget curl xz-utils file p7zip-full bash bc
+
+      - name: Install ESP-IDF v5.5.5 toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 -b v5.5.5 https://github.com/espressif/esp-idf.git ~/esp/esp-idf
+          cd ~/esp/esp-idf
+          # Linux pre-reqs handled by install.sh itself (ubuntu 24.04 compatible)
+          ./install.sh esp32s3 --skip-esp32ulp 2>&1 | tail -20
+          echo "IDF_PATH=$HOME/esp/esp-idf" >> "$GITHUB_ENV"
+          echo "$HOME/.espressif/python_env/idf5.5_py3.13_env/bin" >> "$GITHUB_PATH"
+          ls ~/.espressif/tools/ 2>/dev/null || true
 
       - name: Build firmware
         shell: bash
         run: |
           set -euo pipefail
-          source "$HOME/esp/esp-idf-v55/export.sh"
+          source "$HOME/esp/esp-idf/export.sh"
           cd "$GITHUB_WORKSPACE"
           idf.py set-target esp32s3
           idf.py build
@@ -74,37 +91,86 @@ jobs:
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE"
-          # merge_flash.sh 用 macOS stat -f%z, Linux 下给它兼容 stat 包装
+          # merge_flash.sh 用 macOS stat -f%z, Linux stat -c %s 不同
+          # 给它一个 stat 包装, 自动转发到 /usr/bin/stat -c %s
           mkdir -p /tmp/statwrap
           cat > /tmp/statwrap/stat <<'EOF'
           #!/usr/bin/env bash
-          # macOS stat 兼容层 (Linux 版): stat -f%z → stat -c %s
-          if [ "$1" = "-f%z" ]; then shift; exec /usr/bin/stat -c %s "$@"; fi
-          exec /usr/bin/stat "$@"
+          exec /usr/bin/stat -c %s "$@"
           EOF
           chmod +x /tmp/statwrap/stat
           export PATH="/tmp/statwrap:$PATH"
-
           bash merge_flash.sh
-
           echo "--- Artifact listing ---"
           ls -la build/LinTOS.bin
+          ls -la build/bootloader/bootloader.bin
+          ls -la build/partition_table/partition-table.bin
           ls -la dist/merged_16mb.bin
           sha256sum dist/merged_16mb.bin
 
-      - name: Upload artifacts
+      - name: Upload firmware artifacts
         uses: actions/upload-artifact@v4
         with:
           name: firmware-${{ steps.tag.outputs.tag }}
+          if-no-files-found: error
           path: |
             build/LinTOS.bin
             build/bootloader/bootloader.bin
             build/partition_table/partition-table.bin
             dist/merged_16mb.bin
 
+      - name: Prepare release notes
+        run: |
+          TAG=$(cat /tmp/tag_name.txt)
+          cat > /tmp/release_body.md <<EOF
+          ## LinTOS ${TAG}
+
+          **复古电子词典 / 掌上游戏机固件** — 基于 ESP32-S3 + ST7305 反射式 1bit LCD (400×300).
+
+          ### 本版本主要改进
+
+          - **三键完整物理键导航**: BOOT/KEY/PWR 三颗键分别承担 LEFT/RIGHT/UP + 长按确认/返回/Home 全路径, 无触屏也可完整操作菜单
+          - **多阶段长按状态机**: input.c 按键结构升级为阶段数组, 支持 "短按方向键 / 长按核心动作 / 超长按系统动作" 三段职责分离
+          - **方向键智能延迟释放**: 长按核心动作时自动跳过方向键 (避免 "按 BACK 返回时主菜单先左移一格" 的双发射冲突)
+          - **完整菜单物理键可达**: 主菜单 (方向+确认)、设置滚轮 (四方向)、计算器 (网格导航)、弹窗列表 (UP/DOWN/CONFIRM/BACK) 全部物理键可操作
+          - **GitHub Actions 自动构建 + Release**: tag 推送触发 ESP-IDF v5.5.5 编译, 合并 16MB flash 镜像作为 Release 附件
+
+          ### 烧录
+
+          #### 方式一: 在线刷机 (推荐)
+          浏览器 WebSerial 直刷 16MB 镜像: https://xiayang0521.github.io/ESP32-S3-RLCD-BBK/flash/
+
+          #### 方式二: esptool 命令行
+          \`\`\`
+          esptool.py --chip esp32s3 -b 460800 --before default_reset --after hard_reset \\
+            write_flash --flash_mode dio --flash_size 16MB --flash_freq 80m \\
+            0x0 merged_16mb.bin
+          \`\`\`
+
+          #### 方式三: 多文件烧录 (Flash Download Tool)
+          | 文件 | 烧录地址 |
+          |---|---|
+          | bootloader.bin | 0x000000 |
+          | partition-table.bin | 0x008000 |
+          | LinTOS.bin | 0x020000 |
+          | merged_16mb.bin (单文件全量) | 0x000000 |
+
+          ### 版本信息
+          - ESP-IDF v5.5.5
+          - 目标芯片: ESP32-S3-WROOM-1-N16R8
+          - 构建平台: Ubuntu 24.04 · GitHub Actions
+          EOF
+          cat /tmp/release_body.md
+
+      - name: Create tag if needed (dispatch)
+        if: github.event_name == 'workflow_dispatch' && github.ref_type != 'tag'
+        run: |
+          TAG=$(cat /tmp/tag_name.txt)
+          git tag -a "$TAG" -m "LinTOS ${TAG}"
+          git push origin "$TAG" --force 2>&1 || true   # 如果 tag 已存在 force push 覆盖
+
       - name: Upload merged image as release asset
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: LinTOS ${{ steps.tag.outputs.tag }}
@@ -114,42 +180,3 @@ jobs:
             build/partition_table/partition-table.bin
             build/LinTOS.bin
             dist/merged_16mb.bin
-
-      - name: Prepare release notes
-        run: |
-          TAG=$(cat /tmp/tag_name.txt)
-          cat > /tmp/release_body.md <<EOF
-          ## LinTOS ${TAG}
-          ## 固件功能 / 改进摘要
-
-          - **三键完整物理键导航**: BOOT/KEY/PWR 三颗键分别承担 LEFT/RIGHT/UP + 长按确认/返回/Home 全路径, 无触屏也可完整操作菜单
-          - **多阶段长按状态机**: input.c 按键结构升级为阶段数组, 支持 "短按方向键 / 长按核心动作 / 超长按系统动作" 三段职责分离
-          - **方向键智能延迟释放**: 长按核心动作时自动跳过方向键 (避免 "按 BACK 时主菜单先左移一格" 的双发射冲突)
-          - **完整菜单物理键可达**: 主菜单 (方向+确认)、设置滚轮 (四方向)、计算器 (网格导航)、弹窗列表 (UP/DOWN/CONFIRM/BACK) 全部物理键可操作
-
-          ## 烧录
-
-          ### 方式一: 在线刷机 (推荐)
-          浏览器 WebSerial 直刷 16MB 镜像, 打开: https://xiayang0521.github.io/ESP32-S3-RLCD-BBK/flash/
-
-          ### 方式二: esptool 命令行
-          \`\`\`
-          esptool.py --chip esp32s3 -b 460800 --before default_reset --after hard_reset \\
-            write_flash --flash_mode dio --flash_size 16MB --flash_freq 80m \\
-            0x0 merged_16mb.bin
-          \`\`\`
-
-          ### 方式三: 多文件烧录 (Flash Download Tool)
-          | 文件 | 烧录地址 |
-          |---|---|
-          | bootloader.bin | 0x000000 |
-          | partition-table.bin | 0x008000 |
-          | LinTOS.bin | 0x020000 |
-          | (16MB 全量) merged_16mb.bin | 0x000000 |
-
-          ## 版本信息
-          - ESP-IDF v5.5.5
-          - 工具链 esp-14.2.0_20260121
-          - 目标芯片 ESP32-S3-WROOM-1-N16R8
-          EOF
-          cat /tmp/release_body.md
