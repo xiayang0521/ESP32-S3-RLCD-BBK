@@ -1122,7 +1122,8 @@ static void wifi_scan_dlg_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
         for (int i = 0; i < cnt; i++) {
             char ssid[33];
             if (wifi_manager_get_scan_ssid(i, ssid, sizeof(ssid)) && ssid[0])
-                snprintf(d->items[i], sizeof(d->items[i]), "%s", ssid);
+                snprintf(d->items[i], sizeof(d->items[i]), "%s %d", ssid,
+                         (int)wifi_manager_get_scan_rssi(i));
             else
                 snprintf(d->items[i], sizeof(d->items[i]), "??");
         }

@@ -52,6 +52,8 @@ void wifi_manager_scan_stop(void);
 bool wifi_manager_is_scan_done(void);
 int  wifi_manager_get_scan_count(void);
 bool wifi_manager_get_scan_ssid(int idx, char *out, size_t sz);
+/* V1.8.x: 返回第 idx 条扫描结果的信号强度 RSSI (dBm), 越界返回 0 */
+int8_t wifi_manager_get_scan_rssi(int idx);
 /* V1.5.x: 返回扫描结果原始记录数组 (含 rssi/channel/authmode), 未扫描时 NULL.
  * 注意: 结果由 wifi_manager 内部持有, 供嗅探模块(wifi_probe)直接读取, 不重复抽取. */
 const wifi_ap_record_t *wifi_manager_get_scan_records(void);

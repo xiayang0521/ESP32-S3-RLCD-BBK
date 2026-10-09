@@ -244,6 +244,11 @@ bool wifi_manager_get_scan_ssid(int idx, char *out, size_t sz) {
     return true;
 }
 
+int8_t wifi_manager_get_scan_rssi(int idx) {
+    if (idx < 0 || idx >= s_ap_count) return 0;
+    return s_ap[idx].rssi;
+}
+
 const wifi_ap_record_t *wifi_manager_get_scan_records(void) {
     return s_ap_count > 0 ? s_ap : NULL;
 }
